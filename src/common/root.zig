@@ -16,6 +16,7 @@ pub const random = @import("random.zig");
 pub const duplicate = @import("duplicate.zig");
 pub const session = @import("session.zig");
 pub const redis_ops = @import("redis_ops.zig");
+pub const credentials = @import("credentials.zig");
 
 /// 加密与签名族（对应 Java `me.chanjar.weixin.common.util.crypto/sign` 包）。
 pub const crypt = struct {
@@ -28,4 +29,13 @@ pub const crypt = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
+    // crypt 是嵌套 struct,refAllDecls(@This()) 不递归进其内部声明,
+    // 故 crypt/*.zig 的离线测试此前从未进入测试图。这里顶层显式引用,
+    // 把这 10 个测试挂进图(不改变 pub const crypt 的 API 形状)。
+    _ = @import("crypt/aes_mode.zig");
+    _ = @import("crypt/wx_crypt.zig");
+    _ = @import("crypt/sha1.zig");
+    _ = @import("crypt/sign.zig");
+    _ = @import("crypt/pkcs7.zig");
+    _ = @import("credentials.zig");
 }

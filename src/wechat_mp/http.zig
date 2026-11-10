@@ -18,22 +18,35 @@ pub const WxResult = result_mod.WxResult;
 pub const Response = result_mod.Response;
 
 /// 请求执行器(对应 `RequestExecutor<T, E>` + `RequestHttp` 的组合角色)。
+///
+/// 三个 vtable 槽按「一次性设计到位、可空回退」铺开,mp / open(共用本接口)与
+/// pay 的 V3 接口(另见 `wechat_pay/v3.zig`,自带请求头参数)都能回传响应头:
+///   - `execute`                : 只要 body(最老、所有 mock 都实现);
+///   - `execute_ex`             : 回传 `Response{body,headers}`(V3 应答验签取
+///     `Wechatpay-*` 头的入口)。可空,回退到 `execute` 且响应头为空;
+///   - `execute_with_headers`   : 带**自定义请求头**执行并回传 `Response`
+///     (multipart `Content-Type` 等)。可空,回退到 `execute_ex`/`execute`,
+///     请求头被忽略并如实标注。
+/// 因后两个槽均为带默认 null 的可选字段,既有全部 vtable 字面量(mock 只给
+/// `execute`)零改动即可编译 —— 这就是「先定形状、一次铺开、不反复改 vtable」。
 pub const RequestExecutor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+
+    /// 一个请求/响应头(名/值)。复用 `common.result.Header` 保持全仓单一形状。
+    pub const Header = result_mod.Header;
 
     pub const VTable = struct {
         /// GET(body 为 null)或 POST(body 为原始字节)。
         /// 成功返回响应 body 的 gpa 分配副本(调用方释放);
         /// 网络错误 → WxError.transport(code=-1),交给上层 -1 退避重试。
         execute: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: Method, uri: []const u8, body: ?[]const u8) WxResult([]u8),
-        /// 架构级扩展:带回传响应头的执行(对应 Java `CloseableHttpClient.execute`
-        /// 拿到的 `CloseableHttpResponse` = 响应头 + 实体)。接口形状一次设计到位:
-        /// 返回 `Response{body,headers}`,正是 V3 应答验签所需 `Wechatpay-*` 的来源。
-        /// 可空,默认 null —— 未覆写的实现由 wrapper `executeEx` 统一回退到 `execute`
-        /// (响应头为空),从而「一次性铺开所有调用方」而 `zig build` 全程可过,
-        /// 不必反复改 vtable。真实 std.http 通道回传响应头的限制见 HttpExecutor 注释。
+        /// 带回传响应头的执行(对应 Java `CloseableHttpResponse` = 头 + 实体)。
+        /// 可空,默认 null;未覆写由 `executeEx` 回退到 `execute`,响应头为空。
         execute_ex: ?*const fn (ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: Method, uri: []const u8, body: ?[]const u8) WxResult(Response) = null,
+        /// 带自定义请求头 + 回传响应头的执行。可空,默认 null;未覆写由
+        /// `executeWithHeaders` 回退到 `executeEx`,忽略请求头(诚实标注)。
+        execute_with_headers: ?*const fn (ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: Method, uri: []const u8, req_headers: []const Header, body: ?[]const u8) WxResult(Response) = null,
     };
 
     pub const Method = enum { get, post };
@@ -52,30 +65,121 @@ pub const RequestExecutor = struct {
             .ok => |b| .{ .ok = .{ .body = b, .headers = &.{} } },
         };
     }
+
+    /// 带自定义请求头并回传响应头的执行(对应 Java `MaterialUploadRequestExecutor`
+    /// 设置 `Content-Type`)。实现未覆写 `execute_with_headers` 时回退到 `executeEx`:
+    /// 请求头被忽略、响应头走既有回退 —— 不伪造「已发送自定义头」。
+    pub fn executeWithHeaders(self: RequestExecutor, gpa: std.mem.Allocator, io: std.Io, method: Method, uri: []const u8, req_headers: []const Header, body: ?[]const u8) WxResult(Response) {
+        if (self.vtable.execute_with_headers) |f| return f(self.ptr, gpa, io, method, uri, req_headers, body);
+        return self.executeEx(gpa, io, method, uri, body);
+    }
 };
 
 // ---------------------------------------------------------------------------
 // 真实实现:std.http(内置 TLS)。与 Java ApacheHttpComponentsImpl 对应。
+//
+// 工具链重核(Zig 0.18.0-dev.954+60635c2bd):`Client.fetch` 仍只回 status
+// (`std/http/Client.zig:1801 FetchResult{ status }`),拿不到响应头。要回传响应头
+// 必须走低层 `request -> receiveHead -> readerDecompressing`,并在 `reader()`
+// (会 `invalidateStrings` 复用 head 缓冲)之前从 `head.bytes` 抓头。本轮据此把
+// 真实 HttpExecutor 接到 `execute_ex`/`execute_with_headers`,使 V3 应答验签
+// (Wechatpay-* 头)与 multipart `Content-Type` 有真实通道,不再只靠 mock。
 // ---------------------------------------------------------------------------
+
+/// 低层一发一收的结果:gpa 拥有 body + 解析后的响应头,用毕 `deinit(gpa)`。
+pub const RawHttpResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+    headers: []const result_mod.Header,
+
+    pub fn deinit(self: RawHttpResponse, gpa: std.mem.Allocator) void {
+        var r = Response{ .body = self.body, .headers = self.headers };
+        r.deinit(gpa);
+    }
+};
+
+/// 逐字对照 dev.954 `Client.fetch` 主循环,但额外回传响应头、并允许注入自定义
+/// 请求头(`extra`),替代「只给 status」的 fetch:
+///  - `request(method, uri, .{ .extra_headers = extra, .redirect_behavior })`;
+///  - POST 走 `sendBodyUnflushed`,GET 走 `sendBodiless`;
+///  - `receiveHead` 后**先** `parseHeaders(head.bytes)`,再 `readerDecompressing`
+///    读 body(与 fetch 解压口径一致,支持 identity/gzip/deflate/zstd);
+///  - 重定向:GET 跟随最多 3 次,POST 不跟随(避免重发 payload),与 fetch 同。
+/// 错误以 Zig error 抛出,由调用方折叠成 `WxError.transport`。
+pub fn httpRequest(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    method: RequestExecutor.Method,
+    uri: []const u8,
+    extra: []const std.http.Header,
+    body: ?[]const u8,
+) !RawHttpResponse {
+    var client = std.http.Client{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    const parsed = try std.Uri.parse(uri);
+    const http_method: std.http.Method = switch (method) {
+        .get => .GET,
+        .post => .POST,
+    };
+    const redirects: std.http.Client.Request.RedirectBehavior = if (body == null)
+        .init(3)
+    else
+        .unhandled;
+    var req = try client.request(http_method, parsed, .{
+        .redirect_behavior = redirects,
+        .extra_headers = extra,
+    });
+    defer req.deinit();
+
+    if (body) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var bw = try req.sendBodyUnflushed(&.{});
+        try bw.writer.writeAll(payload);
+        try bw.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    const redirect_buffer: []u8 = if (redirects == .unhandled) &.{} else try gpa.alloc(u8, 8 * 1024);
+    defer if (redirects != .unhandled) gpa.free(redirect_buffer);
+    var response = try req.receiveHead(redirect_buffer);
+    const status = response.head.status;
+
+    // reader()/readerDecompressing() 会 invalidateStrings 并复用 head 缓冲,
+    // 故必须在初始化 body reader 之前把响应头 dupe 出来(纯解析、离线可测)。
+    const headers = try result_mod.parseHeaders(gpa, response.head.bytes);
+    errdefer result_mod.freeHeaders(gpa, headers);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try gpa.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try gpa.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len > 0) gpa.free(decompress_buffer);
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = try reader.streamRemaining(&out.writer);
+    const owned = try out.toOwnedSlice();
+    return .{ .status = status, .body = owned, .headers = headers };
+}
 
 pub const HttpExecutor = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// 对应 Java 侧 `WxPayConfig.httpConnectionTimeout / httpTimeout`。
-    /// **仅记录、暂未生效**(本轮复核加严,保留现状、如实注释、不伪造实现):
-    /// 核对 Zig 0.18.0-dev.935 的 `std.http.Client`:
-    ///  - `fetch` / `FetchOptions` / `RequestOptions` 均无 timeout 字段;
-    ///  - 全文件唯一的 `Io.Timeout` 是 `Client.zig:1449` 的
-    ///    `ConnectTcpOptions.timeout`,但它在 `connectTcpOptions`(1452-1490)
-    ///    **函数体内从未被读取**,是个「声明但未接线」的死字段;
-    ///  - `request()`(1691)走 `connect()`(1607)-> `connectTcp()`(1433)
-    ///    -> `connectTcpOptions(.{ .timeout = .none })`,不带任何 Options。
-    /// 因此即便「弃用 fetch、自行驱动 request + receiveHead + 收包循环」,
-    /// 也无法把 connect/read 超时真正接到连接或读取上 —— 除非改动/绕过标准库。
-    /// 而自行重写 fetch 主循环还会同时失去 fetch 内置的解压(readerDecompressing)、
-    /// 重定向、TLS CA bundle 等处理,风险过高且离线不可测。
-    /// 结论:按用户「若风险过大保留现状与如实注释」处理,字段仅作配置占位,
-    /// 不伪造实现、不宣称已生效。真实网络超时需待标准库支持后接入。
+    /// 对应 Java `WxPayConfig.httpConnectionTimeout / httpTimeout`。
+    /// **仍仅记录、暂未生效**(本轮按 dev.954 重核,如实保留、不伪造实现):
+    ///  - `fetch`/`FetchOptions`/`RequestOptions` 均无 timeout 字段;
+    ///  - 全 `std/http/Client.zig` 唯一的 `Io.Timeout` 是 `ConnectTcpOptions.timeout`
+    ///    (`Client.zig:1449`),但 `connectTcpOptions`(1452-1490)函数体从未读取它,
+    ///    是「声明但未接线」的死字段;`request()` 走 `connect()` 也不带 Options。
+    /// 结论:标准库高层 API(fetch/request)仍无可用 connect/read 超时入口,
+    /// 不擅自绕过/改写标准库,字段仅作配置占位,不宣称已生效。
     connect_timeout_ms: u64 = 3_000,
     read_timeout_ms: u64 = 30_000,
 
@@ -87,43 +191,57 @@ pub const HttpExecutor = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    fn executeImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: RequestExecutor.Method, uri: []const u8, body: ?[]const u8) WxResult([]u8) {
-        _ = ctx;
-        var client = std.http.Client{ .allocator = gpa, .io = io };
-        defer client.deinit();
-
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        errdefer out.deinit();
-
-        const res = client.fetch(.{
-            .location = .{ .url = uri },
-            .method = switch (method) {
-                .get => .GET,
-                .post => .POST,
-            },
-            .payload = body,
-            .response_writer = &out.writer,
-        }) catch |e| return .{ .err = WxError.transport(gpa, "http {s} {s}: {s}", .{ @tagName(method), uri, @errorName(e) }) };
-
-        const resp_body = out.toOwnedSlice() catch |e|
-            return .{ .err = WxError.transport(gpa, "response buffer: {s}", .{@errorName(e)}) };
-        errdefer gpa.free(resp_body);
-
-        if (res.status.class() != .success) {
-            // 语义对齐 Java `SimplePostRequestExecutor.handleResponse`:错误判定以响应
-            // 内容为核心(errcode != 0 由 Service 层折叠为 WxError);但 4xx/5xx 且响应
-            // 体不是微信错误(无 errcode 的 JSON/无 <xml>)时,Java 因 WxError.fromJson
-            // 失败照样抛出 —— 这里在执行器层折叠状态码,避免把门户 HTML 当成功透传。
-            if (std.mem.indexOf(u8, resp_body, "errcode") == null and
-                std.mem.indexOf(u8, resp_body, "<xml") == null)
-            {
-                return .{ .err = WxError.transport(gpa, "http status {d} for {s}", .{ @backingInt(res.status), uri }) };
-            }
+    /// 4xx/5xx 且非微信错误报文 → 折叠为 transport 错误(避免把门户 HTML 当成功);
+    /// 否则把 `RawHttpResponse` 的所有权转移成 `Response{body,headers}`。
+    fn foldAndWrap(gpa: std.mem.Allocator, uri: []const u8, raw: RawHttpResponse) WxResult(Response) {
+        const status = raw.status;
+        if (status.class() != .success and
+            std.mem.indexOf(u8, raw.body, "errcode") == null and
+            std.mem.indexOf(u8, raw.body, "<xml") == null)
+        {
+            raw.deinit(gpa);
+            return .{ .err = WxError.transport(gpa, "http status {d} for {s}", .{ @backingInt(status), uri }) };
         }
-        return .{ .ok = resp_body };
+        return .{ .ok = .{ .body = raw.body, .headers = raw.headers } };
     }
 
-    const vtable = RequestExecutor.VTable{ .execute = executeImpl };
+    /// 真实执行:回传 `Response{body,headers}`(响应头由 httpRequest 抓取)。
+    fn executeExImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: RequestExecutor.Method, uri: []const u8, body: ?[]const u8) WxResult(Response) {
+        _ = ctx;
+        const raw = httpRequest(gpa, io, method, uri, &.{}, body) catch |e|
+            return .{ .err = WxError.transport(gpa, "http {s} {s}: {s}", .{ @tagName(method), uri, @errorName(e) }) };
+        return foldAndWrap(gpa, uri, raw);
+    }
+
+    /// 带自定义请求头的真实执行:把 `result.Header` 转成 `std.http.Header` 交给
+    /// `extra_headers`,同时回传响应头(multipart `Content-Type` 用)。
+    fn executeWithHeadersImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: RequestExecutor.Method, uri: []const u8, req_headers: []const RequestExecutor.Header, body: ?[]const u8) WxResult(Response) {
+        _ = ctx;
+        var extra = std.ArrayList(std.http.Header).empty;
+        defer extra.deinit(gpa);
+        for (req_headers) |h| {
+            extra.append(gpa, .{ .name = h.name, .value = h.value }) catch
+                return .{ .err = WxError.transport(gpa, "oom", .{}) };
+        }
+        const raw = httpRequest(gpa, io, method, uri, extra.items, body) catch |e|
+            return .{ .err = WxError.transport(gpa, "http {s} {s}: {s}", .{ @tagName(method), uri, @errorName(e) }) };
+        return foldAndWrap(gpa, uri, raw);
+    }
+
+    /// 只要 body 的兼容路径:委托 executeExImpl 后 `takeBody`(释放响应头、返回 body)。
+    fn executeImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: RequestExecutor.Method, uri: []const u8, body: ?[]const u8) WxResult([]u8) {
+        return switch (executeExImpl(ctx, gpa, io, method, uri, body)) {
+            .err => |e| .{ .err = e },
+            .ok => |r| .{ .ok = r.takeBody(gpa) },
+        };
+    }
+
+    /// 三个槽一次填齐:真实通道现在能回传响应头、并接受自定义请求头。
+    const vtable = RequestExecutor.VTable{
+        .execute = executeImpl,
+        .execute_ex = executeExImpl,
+        .execute_with_headers = executeWithHeadersImpl,
+    };
 };
 
 // ---------------------------------------------------------------------------
@@ -392,6 +510,34 @@ test "JsapiTicketFetcher: GET type=jsapi + access_token, parse ticket/expires_in
     try std.testing.expectEqual(@as(usize, 1), cap.calls);
     try std.testing.expect(std.mem.indexOf(u8, cap.last_uri, "type=jsapi") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.last_uri, "access_token=ACCESS_TOKEN") != null);
+}
+
+test "HttpExecutor (real std.http) vtable now carries header-capable slots" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 引用真实执行器(而非 mock)强制分析低层 httpRequest 链路;同时证明
+    // Service 层现在有一条可注入「真实执行器」的构造路径(不再只有 mock 可用)。
+    var http = HttpExecutor.init(gpa, io);
+    const exec = http.executor();
+    try std.testing.expect(exec.vtable.execute_ex != null);
+    try std.testing.expect(exec.vtable.execute_with_headers != null);
+
+    // httpRequest 在 reader() 之前调用的解析入口:能从原始 head 抓出
+    // V3 验签 / Content-Type 头(纯函数、离线、无需真实网络)。
+    const head =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Wechatpay-Timestamp: 1700000000\r\n" ++
+        "Wechatpay-Signature: SIG\r\n" ++
+        "\r\n";
+    const hs = try result_mod.parseHeaders(gpa, head);
+    defer result_mod.freeHeaders(gpa, hs);
+    try std.testing.expectEqualStrings("application/json", result_mod.headerValue(hs, "content-type").?);
+    try std.testing.expectEqualStrings("1700000000", result_mod.headerValue(hs, "WECHATPAY-TIMESTAMP").?);
+    try std.testing.expectEqualStrings("SIG", result_mod.headerValue(hs, "Wechatpay-Signature").?);
 }
 
 test "RequestExecutor.executeEx passes back response headers (V3 verify seam)" {

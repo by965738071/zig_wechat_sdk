@@ -222,3 +222,117 @@ test "xml builder + extract" {
         xml,
     );
 }
+
+// ---------------------------------------------------------------------------
+// 边界 / 错误路径(畸形、截断、XXE、空值、超长输入)
+// ---------------------------------------------------------------------------
+
+test "xml parse: XXE / DOCTYPE rejected (XmlUtilsTest.java testXml2Map_xxe)" {
+    const gpa = std.testing.allocator;
+    // 逐字迁移 Java XmlUtilsTest.testXml2Map_xxe 的报文:遇到 <!DOCTYPE 直接拒绝。
+    const xxe =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
+        "<!DOCTYPE test [\n" ++
+        "<!ENTITY xxe SYSTEM \"file:///etc/passwd\">\n" ++
+        "]>\n" ++
+        "<xml></xml>";
+    try std.testing.expectError(error.InvalidDoctype, parse(gpa, xxe));
+    // <!Entity 变体同样拒绝(对齐 XStream 禁用 DTD 的 XXE 防护)。
+    try std.testing.expectError(error.InvalidDoctype, parse(gpa, "<xml><!Entity foo></xml>"));
+}
+
+test "xml parse: truncated / mismatched / unterminated constructs -> InvalidXml" {
+    const gpa = std.testing.allocator;
+    // 截断报文:标签未闭合,收尾校验 stack 非空 -> InvalidXml(不被当成空结果吞掉)。
+    try std.testing.expectError(error.InvalidXml, parse(gpa, "<xml><a>1"));
+    try std.testing.expectError(error.InvalidXml, parse(gpa, "<xml"));
+    // 闭合标签名与栈顶不匹配。
+    try std.testing.expectError(error.InvalidXml, parse(gpa, "<xml><a></b></xml>"));
+    // 空标签名 <>.
+    try std.testing.expectError(error.InvalidXml, parse(gpa, "<xml><></xml>"));
+    // 各「未终止」构造:CDATA / 注释 / 处理指令。
+    try std.testing.expectError(error.InvalidXml, parse(gpa, "<xml><a><![CDATA[never closed</a></xml>"));
+    try std.testing.expectError(error.InvalidXml, parse(gpa, "<xml><!-- never closed"));
+    try std.testing.expectError(error.InvalidXml, parse(gpa, "<xml><?xml version=\"1.0\""));
+}
+
+test "xml parse: comments / PI / self-closing / attributes / whitespace" {
+    const gpa = std.testing.allocator;
+    const doc =
+        "<?xml version=\"1.0\"?>\n" ++
+        "<xml>\n" ++
+        "<!-- a comment -->\n" ++
+        "<a>  spaced  </a>\n" ++
+        "<b attr=\"ignored\">value</b>\n" ++
+        "<empty/>\n" ++
+        "</xml>";
+    var m = try parse(gpa, doc);
+    defer freeMap(&m);
+    try std.testing.expectEqualStrings("spaced", m.get("a").?); // 叶子文本 trim
+    try std.testing.expectEqualStrings("value", m.get("b").?); // 属性被剥离
+    try std.testing.expectEqualStrings("", m.get("empty").?); // 自闭合 -> 空值
+    try std.testing.expectEqual(@as(usize, 3), m.count());
+}
+
+test "xml parse: flat-only, nested children skipped (骨架已知限制)" {
+    const gpa = std.testing.allocator;
+    const doc = "<xml><outer><inner>deep</inner></outer><leaf>ok</leaf></xml>";
+    var m = try parse(gpa, doc);
+    defer freeMap(&m);
+    // 骨架只保留 <xml> 直接叶子字段:嵌套 inner 被跳过。
+    // 注:Java XmlUtils.xml2Map 会返回嵌套 Map(见 XmlUtilsTest.testXml2Map),
+    // 这是骨架的已知简化,不宣称与 Java 一致。
+    try std.testing.expect(m.get("inner") == null);
+    try std.testing.expectEqualStrings("ok", m.get("leaf").?);
+    try std.testing.expectEqualStrings("", m.get("outer").?);
+}
+
+test "xml escape + Builder(cdata / addIfNotEmpty)" {
+    const gpa = std.testing.allocator;
+    {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        errdefer out.deinit();
+        try escape(&out.writer, "a<b>c&d\"e'f"); // 5 个需转义字符全覆盖
+        const s = try out.toOwnedSlice();
+        defer gpa.free(s);
+        try std.testing.expectEqualStrings("a&lt;b&gt;c&amp;d&quot;e&apos;f", s);
+    }
+    {
+        var b = Builder.init(gpa);
+        defer b.deinit();
+        try b.add("A", "x<y"); // cdata 路径:值原样不转义
+        try b.addIfNotEmpty("SKIP", ""); // 空值跳过(微信「空字段不下发」)
+        try b.addIfNotEmpty("B", "value");
+        const s = try b.finish(true);
+        defer gpa.free(s);
+        try std.testing.expectEqualStrings("<xml><A><![CDATA[x<y]]></A><B><![CDATA[value]]></B></xml>", s);
+    }
+}
+
+test "xml extractTag: CDATA / plain / missing / unclosed" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqualStrings("Hello", extractTag(gpa, "<xml><a><![CDATA[Hello]]></a></xml>", "a").?);
+    try std.testing.expectEqualStrings("World", extractTag(gpa, "<xml><a>World</a></xml>", "a").?);
+    try std.testing.expect(extractTag(gpa, "<xml><a>World</a></xml>", "missing") == null);
+    try std.testing.expect(extractTag(gpa, "<xml><a>World", "a") == null); // 无闭合标签
+}
+
+test "xml parse: empty input + very long value (空值 / 超长输入)" {
+    const gpa = std.testing.allocator;
+    {
+        var m = try parse(gpa, "");
+        defer freeMap(&m);
+        try std.testing.expectEqual(@as(usize, 0), m.count());
+    }
+    {
+        const big = try gpa.alloc(u8, 100_000);
+        defer gpa.free(big);
+        @memset(big, 'x');
+        const doc = try std.fmt.allocPrint(gpa, "<xml><big>{s}</big></xml>", .{big});
+        defer gpa.free(doc);
+        var m = try parse(gpa, doc);
+        defer freeMap(&m); // 先于 doc 释放(key 借用 doc)
+        try std.testing.expectEqualStrings(big, m.get("big").?);
+        try std.testing.expectEqual(@as(usize, 100_000), m.get("big").?.len);
+    }
+}

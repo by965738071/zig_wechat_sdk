@@ -186,3 +186,92 @@ test "lock registry: key identity survives map growth + cleanup" {
     first.unlock(io);
     // deinit 由 std.testing.allocator 兜底:若 key/KeyLock 泄漏则测试失败。
 }
+
+// ---------------------------------------------------------------------------
+// 真并发(std.Io.Threaded 的 worker 线程)+ 确定性编排
+// ---------------------------------------------------------------------------
+
+/// 一次性放行门:N 个线程各自到达后自旋,main 等齐再统一放行。
+/// 不用裸 sleep、不断言任何时序,只保证「尽量同时开跑」,断言只依赖最终不变量。
+const StartGate = struct {
+    open: std.atomic.Value(bool) = .init(false),
+    arrived: std.atomic.Value(u32) = .init(0),
+
+    fn wait(self: *StartGate) void {
+        _ = self.arrived.fetchAdd(1, .monotonic);
+        while (!self.open.load(.acquire)) std.atomic.spinLoopHint();
+    }
+};
+
+/// 一个 worker:过门后按 key 取锁、tryLock 一次并记录结果。
+/// 故意不 unlock:拿到锁的线程保持持有,这样「同 key 恰好一个赢」才是
+/// 互斥的真实验证(若解锁,后续线程会依次拿到,8 个全赢,失去意义)。
+fn lockWorker(io: std.Io, gate: *StartGate, reg: *LockRegistry, key: []const u8, out: *bool) void {
+    gate.wait();
+    const l = reg.get(io, key) catch {
+        out.* = false;
+        return;
+    };
+    out.* = l.tryLock(io, 0);
+}
+
+test "concurrency: N real threads, same key -> exactly one wins (mutual exclusion)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var reg = LockRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    const N = 8;
+    var gate = StartGate{};
+    var results: [N]bool = undefined;
+    var futures: [N]std.Io.Future(void) = undefined;
+    for (0..N) |i| {
+        results[i] = false;
+        futures[i] = try io.concurrent(lockWorker, .{ io, &gate, &reg, "SAME", &results[i] });
+    }
+    // 等齐 N 个 worker 再一起放行:确定性编排,不依赖 sleep / 时序巧合。
+    while (gate.arrived.load(.acquire) < N) std.atomic.spinLoopHint();
+    gate.open.store(true, .release);
+    for (0..N) |i| _ = futures[i].await(io);
+
+    // 同一 key 共用一把锁:held 标志在 kl.mutex 下原子翻转,
+    // 无论线程如何调度,恰好一个成功。若退化成「各线程各拿一把」则会 >1。
+    var wins: usize = 0;
+    for (results) |r| if (r) {
+        wins += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), wins);
+}
+
+test "concurrency: N real threads, distinct keys -> all win (true parallelism)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var reg = LockRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    const keys = [_][]const u8{ "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7" };
+    const N = keys.len;
+    var gate = StartGate{};
+    var results: [N]bool = undefined;
+    var futures: [N]std.Io.Future(void) = undefined;
+    for (0..N) |i| {
+        results[i] = false;
+        futures[i] = try io.concurrent(lockWorker, .{ io, &gate, &reg, keys[i], &results[i] });
+    }
+    // 并发 get(distinct key) 同时触发 StringHashMap 插入,由 map_mutex 保护。
+    while (gate.arrived.load(.acquire) < N) std.atomic.spinLoopHint();
+    gate.open.store(true, .release);
+    for (0..N) |i| _ = futures[i].await(io);
+
+    // 不同 key 互不阻塞:N 个线程同时各自拿到锁。
+    // 若退化成全局单锁,则只会有 1 个成功(与同 key 用例一样),本断言即失败。
+    var wins: usize = 0;
+    for (results) |r| if (r) {
+        wins += 1;
+    };
+    try std.testing.expectEqual(@as(usize, N), wins);
+}

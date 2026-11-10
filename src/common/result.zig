@@ -83,6 +83,17 @@ pub const Response = struct {
     }
 };
 
+/// 释放 `dupeHeaders`/`parseHeaders` 产出的 gpa 拥有的头列表(空占位安全)。
+/// 供真实执行器在「只要 body」路径丢弃响应头时复用,与 `Response.takeBody` 同口径。
+pub fn freeHeaders(gpa: std.mem.Allocator, headers: []const Header) void {
+    if (headers.len == 0) return;
+    for (headers) |h| {
+        gpa.free(@constCast(h.name));
+        gpa.free(@constCast(h.value));
+    }
+    gpa.free(@constCast(headers));
+}
+
 /// 大小写不敏感地在头列表里找第一个匹配项,返回值(与 `getFirstHeader` 一致)。
 pub fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
     for (headers) |h| {
@@ -158,7 +169,8 @@ pub fn err(comptime T: type, e: WxError) WxResult(T) {
 /// 把 `!T`（Zig 错误）折叠为 `WxResult(T)`：transport 错误 → WxError(code=-1)。
 /// 对应 Java 里 `catch (IOException e) { throw new WxErrorException(e); }`。
 pub fn fromZig(comptime T: type, allocator: std.mem.Allocator, r: anyerror!T) WxResult(T) {
-    return r catch |e| .{ .err = WxError.transport(allocator, "transport error: {s}", .{@errorName(e)}) };
+    const v = r catch |e| return .{ .err = WxError.transport(allocator, "transport error: {s}", .{@errorName(e)}) };
+    return .{ .ok = v };
 }
 
 test "WxResult basics" {
@@ -208,4 +220,179 @@ test "parseHeaders parses a raw HTTP head (protocol seam)" {
     try std.testing.expectEqualStrings("SERIAL1", resp.header("Wechatpay-Serial").?);
     try std.testing.expectEqualStrings("application/json; charset=utf-8", resp.header("content-type").?);
     try std.testing.expectEqual(@as(usize, 5), headers.len);
+}
+
+// ---------------------------------------------------------------------------
+// 边界 / 辅助方法覆盖
+// ---------------------------------------------------------------------------
+
+test "WxResult helpers: ok/err/value/failed" {
+    const gpa = std.testing.allocator;
+    {
+        const r: WxResult(u32) = ok(u32, 42);
+        try std.testing.expect(!r.failed());
+        try std.testing.expectEqual(@as(u32, 42), r.value().?.*);
+    }
+    {
+        const r: WxResult(u32) = err(u32, WxError{ .allocator = gpa, .error_code = 40001, .error_msg = "x" });
+        try std.testing.expect(r.failed());
+        try std.testing.expectEqual(@as(?*const u32, null), r.value());
+    }
+    // fromZig 的成功/错误两路径由文件末「fromZig」用例单独覆盖(此前该函数存在
+    // 「成功值未包进 .ok」的缺陷,本轮已修复)。
+}
+
+test "freeHeaders: owned headers released, empty placeholder safe" {
+    const gpa = std.testing.allocator;
+    const raw = [_]Header{
+        .{ .name = "A", .value = "1" },
+        .{ .name = "B", .value = "2" },
+    };
+    const hs = try dupeHeaders(gpa, &raw);
+    freeHeaders(gpa, hs); // 由 testing.allocator 兜底:漏/重复 free 都会失败
+    // 静态空占位(&.{})是合法的「无响应头」,不应被 free。
+    freeHeaders(gpa, &.{});
+    const parsed = try parseHeaders(gpa, "HTTP/1.1 200 OK\r\nX: y\r\n\r\n");
+    freeHeaders(gpa, parsed);
+}
+
+test "Response.takeBody frees headers and transfers body" {
+    const gpa = std.testing.allocator;
+    {
+        const raw = [_]Header{
+            .{ .name = "A", .value = "1" },
+            .{ .name = "B", .value = "2" },
+        };
+        const headers = try dupeHeaders(gpa, &raw);
+        var resp = Response{ .body = try gpa.dupe(u8, "BODY"), .headers = headers };
+        const body = resp.takeBody(gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("BODY", body);
+        // 若 takeBody 漏释放 headers,testing.allocator 会报泄漏。
+    }
+    {
+        // headers == &.{} 静态空占位:takeBody 不应 free 数组,只返回 body。
+        var resp = Response{ .body = try gpa.dupe(u8, "X"), .headers = &.{} };
+        const body = resp.takeBody(gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("X", body);
+    }
+}
+
+test "headerValue first-match / dupeHeaders(empty) / parseHeaders(no headers)" {
+    const gpa = std.testing.allocator;
+    const hs = [_]Header{
+        .{ .name = "X-Dup", .value = "first" },
+        .{ .name = "x-dup", .value = "second" },
+    };
+    // getFirstHeader 口径:大小写不敏感且返回第一个匹配。
+    try std.testing.expectEqualStrings("first", headerValue(&hs, "X-DUP").?);
+    try std.testing.expect(headerValue(&hs, "missing") == null);
+
+    // 空头列表返回静态占位,长度为 0。
+    const empty = try dupeHeaders(gpa, &.{});
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    // 只有状态行、无头字段的 HTTP head -> 空头列表。
+    const head = "HTTP/1.1 204 No Content\r\n\r\n";
+    const parsed = try parseHeaders(gpa, head);
+    try std.testing.expectEqual(@as(usize, 0), parsed.len);
+    var r = Response{ .body = try gpa.dupe(u8, ""), .headers = parsed };
+    r.deinit(gpa); // 空头占位 + body 一并释放
+}
+
+// ---------------------------------------------------------------------------
+// fromZig:!T -> WxResult(T) 的成功/错误两路径(修复后覆盖)
+// ---------------------------------------------------------------------------
+
+test "fromZig: success wraps value in .ok; error folds to transport .err" {
+    const gpa = std.testing.allocator;
+    // 成功值确实进 .ok(此前缺陷:直接返回裸 T,从未包进 .ok)
+    {
+        var r = fromZig(u32, gpa, @as(anyerror!u32, 42));
+        switch (r) {
+            .ok => |v| try std.testing.expectEqual(@as(u32, 42), v),
+            .err => |*e| {
+                defer e.deinit();
+                return error.ShouldBeOk;
+            },
+        }
+    }
+    // 错误折叠成 transport .err,code=-1,文案含 @errorName(e)
+    {
+        var r = fromZig(u32, gpa, @as(anyerror!u32, error.Boom));
+        switch (r) {
+            .ok => return error.ShouldBeErr,
+            .err => |*e| {
+                defer e.deinit(); // error_msg 由 allocPrint 拥有
+                try std.testing.expectEqual(WxError.Source.transport, e.source);
+                try std.testing.expectEqual(@as(i64, -1), e.error_code);
+                try std.testing.expectEqualStrings("transport error: Boom", e.error_msg);
+            },
+        }
+    }
+    // void 载荷同样成立(Done 场景)
+    {
+        var r = fromZig(void, gpa, @as(anyerror!void, {}));
+        switch (r) {
+            .ok => {},
+            .err => |*e| {
+                defer e.deinit();
+                return error.ShouldBeOk;
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OOM / 失败回退:dupeHeaders / parseHeaders 的 errdefer 逐点注入
+// ---------------------------------------------------------------------------
+
+test "dupeHeaders/parseHeaders: OOM unwinds errdefer with no leak" {
+    const raw = [_]Header{
+        .{ .name = "X-One", .value = "value-1" },
+        .{ .name = "X-Two", .value = "value-2" },
+    };
+    const head =
+        "HTTP/1.1 200 OK\r\n" ++
+        "X-One: value-1\r\n" ++
+        "X-Two: value-2\r\n" ++
+        "\r\n";
+
+    const H = struct {
+        fn freeOwned(gpa: std.mem.Allocator, hs: []const Header) void {
+            for (hs) |h| {
+                gpa.free(@constCast(h.name));
+                gpa.free(@constCast(h.value));
+            }
+            if (hs.len > 0) gpa.free(@constCast(hs));
+        }
+    };
+
+    // 每个 fail_index 用全新 FailingAllocator 逐点注入 OOM:命中中途分配 ->
+    // expectError(OutOfMemory),由函数级 errdefer + 「v dupe 失败时 free(n)」
+    // 负责清理;未命中(fail_index 落在分配次数之外) -> 成功返回,手动释放。
+    // 底层是 std.testing.allocator,两条路径任何泄漏都会在测试结束时被抓出。
+    for ([_]usize{ 0, 1, 2, 3, 4, 5 }) |fail_at| {
+        {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+            const fa = failing.allocator();
+            if (dupeHeaders(fa, &raw)) |hs| {
+                H.freeOwned(fa, hs);
+            } else |e| {
+                try std.testing.expectEqual(error.OutOfMemory, e);
+                try std.testing.expect(failing.has_induced_failure);
+            }
+        }
+        {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+            const fa = failing.allocator();
+            if (parseHeaders(fa, head)) |hs| {
+                H.freeOwned(fa, hs);
+            } else |e| {
+                try std.testing.expectEqual(error.OutOfMemory, e);
+                try std.testing.expect(failing.has_induced_failure);
+            }
+        }
+    }
 }

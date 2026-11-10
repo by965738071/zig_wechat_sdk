@@ -1,6 +1,7 @@
 //! 微信支付配置 —— 对应 Java `config.WxPayConfig`。
 //! V2(XML+MD5/HMAC)与 V3(JSON+RSA+AES-GCM)两套凭据并存,与 Java 一致。
 const std = @import("std");
+const credentials = @import("common").credentials;
 
 pub const SignType = enum {
     md5, // 默认(V2)
@@ -69,7 +70,10 @@ pub const PayConfig = struct {
     /// (见 `v3.zig`/service 的 mTLS 接缝),本骨架仅保存配置,不伪造通道。
     key_string: []u8 = "",
 
-    // HTTP 超时(对应 Java httpConnectionTimeout/httpTimeout),骨架仅记录
+    // HTTP 超时(对应 Java httpConnectionTimeout/httpTimeout)。工具链重核
+    // (0.18.0-dev.954):std.http.Client 的 fetch/request 仍无可用 connect/read
+    // 超时入口(ConnectTcpOptions.timeout 是未接线的死字段),故字段仅作配置占位、
+    // 不宣称已生效,详见 mp/http.zig HttpExecutor 注释。
     connect_timeout_ms: u64 = 3_000,
     read_timeout_ms: u64 = 30_000,
     pub const InitArgs = struct {
@@ -105,6 +109,16 @@ pub const PayConfig = struct {
             .sub_mch_id = try gpa.dupe(u8, args.sub_mch_id),
             .key_string = try gpa.dupe(u8, args.key_string),
         };
+    }
+
+    /// 从凭证来源(文件/环境变量/文本)加载 V3 商户私钥 PEM 到 `private_key_pem`,
+    /// 替换旧值。对应 Java `WxPayConfig` 从文件/配置中心加载 privateKey。
+    /// 加载后由 `sign.KeySigner.fromPem` 消费(见 `service.zig initProduction`),
+    /// 使该字段真正参与 V3 请求签名;错误信息只含来源标识,不回显密钥材料。
+    pub fn loadPrivateKey(self: *PayConfig, io: std.Io, src: credentials.Source) !void {
+        const pem = try credentials.read(self.gpa, io, src);
+        self.gpa.free(self.private_key_pem);
+        self.private_key_pem = pem;
     }
 
     pub fn deinit(self: *PayConfig) void {
@@ -171,4 +185,20 @@ test "PayConfig remaining fields stored/freed + effectiveTradeType fallback" {
     defer cfg2.deinit();
     try std.testing.expectEqualStrings("JSAPI", cfg2.effectiveTradeType());
     try std.testing.expectEqualStrings("", cfg2.sub_appid);
+}
+
+test "PayConfig.loadPrivateKey: from text source, private_key_pem stored + freed" {
+    const gpa = std.testing.allocator;
+    var cfg = try PayConfig.init(gpa, .{ .appid = "wxp", .mch_id = "1900010" });
+    defer cfg.deinit();
+
+    try std.testing.expectEqualStrings("", cfg.private_key_pem);
+    // 用内嵌测试密钥材料(非真实凭证),经 Source.text 注入。
+    const pem = "-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----\n";
+    try cfg.loadPrivateKey(undefined, .{ .text = pem });
+    try std.testing.expectEqualStrings(pem, cfg.private_key_pem);
+    // 二次加载替换旧值(deinit 只释放最终值,testing.allocator 兜底无泄漏)。
+    const pem2 = "-----BEGIN PRIVATE KEY-----\nTEST2\n-----END PRIVATE KEY-----\n";
+    try cfg.loadPrivateKey(undefined, .{ .text = pem2 });
+    try std.testing.expectEqualStrings(pem2, cfg.private_key_pem);
 }

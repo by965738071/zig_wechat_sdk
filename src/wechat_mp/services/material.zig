@@ -259,10 +259,10 @@ pub const MaterialService = struct {
     /// 纯本地组包(`buildMultipartBody`)+ 现有 RequestExecutor 字节流通道(svc.post),
     /// 不引入 HTTP 栈。视频素材用 `addVideo` 附带 description 表单字段。
     ///
-    /// ⚠️ 接缝:`Content-Type: multipart/form-data; boundary=...` 请求头需由支持
-    /// 请求头的执行器设置;当前 mp `RequestExecutor` vtable 只有 (method,uri,body)
-    /// 字节流,无 header 槽。body 组包与离线单测完整,真网络上传需 header-capable
-    /// 执行器配合 `multipartContentType(boundary)` 产出的头值,不伪造已联调。
+    /// `Content-Type: multipart/form-data; boundary=...` 现经
+    /// `Service.postWithHeaders` 交给 `execute_with_headers` 槽(真实 std.http
+    /// 执行器会作为 `extra_headers` 发出);未实现该槽的 mock 由 wrapper 回退、
+    /// 忽略请求头,离线单测照常。body 组包与头值均离线可测,真网络上传仍需真凭证。
     pub fn add(self: *MaterialService, io: std.Io, mtype: []const u8, filename: []const u8, content: []const u8) WxResult(AddResult) {
         return self.addParts(io, mtype, filename, content, null);
     }
@@ -291,7 +291,16 @@ pub const MaterialService = struct {
             return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(uri);
 
-        const resp = switch (self.svc.post(io, uri, &.{}, body)) {
+        // multipart 的 Content-Type 请求头(对应 Java MaterialUploadRequestExecutor)。
+        // 经 Service.postWithHeaders -> execute_with_headers 槽发出;mock 回退时忽略。
+        const ct = multipartContentType(gpa, boundary) catch |e|
+            return .{ .err = result_mod.WxError.internal(gpa, "multipart content-type: {s}", .{@errorName(e)}) };
+        defer gpa.free(ct);
+        const req_headers = [_]result_mod.Header{
+            .{ .name = "Content-Type", .value = ct },
+        };
+
+        const resp = switch (self.svc.postWithHeaders(io, uri, &.{}, body, &req_headers)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
@@ -683,4 +692,100 @@ test "buildMultipartBody: exact bytes, media + description, boundary; header inj
     try testing.expectError(error.InvalidFilename, buildMultipartBody(gpa, "B", "a\"b", "x", null));
     try testing.expectError(error.InvalidBoundary, buildMultipartBody(gpa, "B\r\nX", "f", "x", null));
     try testing.expectError(error.InvalidBoundary, buildMultipartBody(gpa, "", "f", "x", null));
+}
+
+// ---------------------------------------------------------------------------
+// multipart Content-Type 经 execute_with_headers 槽传递(离线单测)
+// ---------------------------------------------------------------------------
+
+/// 实现了 `execute_with_headers` 槽的 mock:捕获请求头,证明 multipart 的
+/// Content-Type 真的从 Service 传到了 header-capable 执行器(而非被丢弃)。
+const HeaderCapture = struct {
+    gpa: std.mem.Allocator,
+    response: []const u8,
+    calls: usize = 0,
+    captured_ct: []u8 = &.{},
+    captured_body: []u8 = &.{},
+
+    fn deinit(self: *HeaderCapture) void {
+        if (self.captured_ct.len > 0) self.gpa.free(self.captured_ct);
+        if (self.captured_body.len > 0) self.gpa.free(self.captured_body);
+    }
+
+    fn executor(self: *HeaderCapture) http_mod.RequestExecutor {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn route(ctx: *anyopaque, gpa: std.mem.Allocator, body: ?[]const u8) WxResult([]u8) {
+        const self: *HeaderCapture = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const b = body orelse "";
+        if (self.captured_body.len > 0) self.gpa.free(self.captured_body);
+        self.captured_body = gpa.dupe(u8, b) catch return .{ .err = error_mod.WxError.transport(gpa, "oom", .{}) };
+        return .{ .ok = gpa.dupe(u8, self.response) catch return .{ .err = error_mod.WxError.transport(gpa, "oom", .{}) } };
+    }
+
+    fn executeImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: http_mod.RequestExecutor.Method, uri: []const u8, body: ?[]const u8) WxResult([]u8) {
+        _ = io;
+        _ = method;
+        _ = uri;
+        return route(ctx, gpa, body);
+    }
+
+    fn executeWithHeadersImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: http_mod.RequestExecutor.Method, uri: []const u8, req_headers: []const result_mod.Header, body: ?[]const u8) WxResult(result_mod.Response) {
+        _ = io;
+        _ = method;
+        _ = uri;
+        const self: *HeaderCapture = @ptrCast(@alignCast(ctx));
+        if (result_mod.headerValue(req_headers, "Content-Type")) |ct| {
+            if (self.captured_ct.len > 0) self.gpa.free(self.captured_ct);
+            self.captured_ct = gpa.dupe(u8, ct) catch return .{ .err = error_mod.WxError.transport(gpa, "oom", .{}) };
+        }
+        return switch (route(ctx, gpa, body)) {
+            .err => |e| .{ .err = e },
+            .ok => |b| .{ .ok = .{ .body = b, .headers = &.{} } },
+        };
+    }
+
+    const vtable = http_mod.RequestExecutor.VTable{
+        .execute = executeImpl,
+        .execute_with_headers = executeWithHeadersImpl,
+    };
+};
+
+test "material add sends multipart Content-Type through execute_with_headers" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cap = HeaderCapture{ .gpa = gpa, .response = "{\"media_id\":\"MEDIA1\",\"url\":\"http://u\"}" };
+    defer cap.deinit();
+    var cfg = try config_mod.InMemoryConfigStorage.init(
+        gpa,
+        .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } },
+        .{ .appid = "A", .secret = "S" },
+    );
+    defer cfg.deinit();
+    var base = service_mod.Service.init(gpa, cfg.config(), cap.executor());
+    var svc = MaterialService{ .svc = &base };
+
+    switch (svc.add(io, "image", "a.png", "PNGDATA")) {
+        .ok => |*r| {
+            var res = r.*;
+            defer res.deinit();
+            try testing.expectEqualStrings("MEDIA1", res.media_id);
+        },
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.UnexpectedAddError;
+        },
+    }
+    try testing.expectEqual(@as(usize, 1), cap.calls);
+    // Content-Type 确实到达执行器,且带 multipart/form-data + boundary
+    try testing.expect(std.mem.startsWith(u8, cap.captured_ct, "multipart/form-data; boundary=WxZig"));
+    // multipart body 也确实发出(含 boundary + 文件名)
+    try testing.expect(std.mem.indexOf(u8, cap.captured_body, "name=\"media\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.captured_body, "a.png") != null);
 }

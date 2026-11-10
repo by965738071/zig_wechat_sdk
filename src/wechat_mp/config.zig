@@ -10,6 +10,7 @@ const std = @import("std");
 const token_mod = @import("common").token;
 const error_mod = @import("common").error_util;
 const result_mod = @import("common").result;
+const credentials = @import("common").credentials;
 
 pub const WxResult = result_mod.WxResult;
 
@@ -124,6 +125,32 @@ pub const InMemoryConfigStorage = struct {
             .token_ = try gpa.dupe(u8, args.token),
             .aes_key_ = try gpa.dupe(u8, args.aes_key),
         };
+    }
+
+    /// 凭证注入构造(对应 Java 从环境/配置中心注入 appid/secret)。
+    /// appid/secret 由 `credentials.Source`(文件/环境变量/文本)读入,值由返回
+    /// 的 storage 拥有;错误只暴露来源标识,不回显材料。与 `init` 同协议,只是把
+    /// 凭据来源外置,便于生产从文件/环境变量加载、离线测试用 `Source.text`。
+    pub const CredentialArgs = struct {
+        appid: credentials.Source,
+        secret: credentials.Source,
+        token: []const u8 = "",
+        aes_key: []const u8 = "",
+        ticket_fetcher: ?token_mod.Fetcher = null,
+    };
+
+    pub fn initWithCredentials(gpa: std.mem.Allocator, fetcher: token_mod.Fetcher, io: std.Io, args: CredentialArgs) !InMemoryConfigStorage {
+        const appid = try credentials.read(gpa, io, args.appid);
+        defer gpa.free(appid);
+        const secret = try credentials.read(gpa, io, args.secret);
+        defer gpa.free(secret);
+        return init(gpa, fetcher, .{
+            .appid = appid,
+            .secret = secret,
+            .token = args.token,
+            .aes_key = args.aes_key,
+            .ticket_fetcher = args.ticket_fetcher,
+        });
     }
 
     pub fn deinit(self: *InMemoryConfigStorage) void {
@@ -366,4 +393,34 @@ test "jsapi ticket: no ticket_fetcher -> honest config error, not fake" {
             try std.testing.expectEqual(error_mod.WxError.Source.config, err.source);
         },
     }
+}
+
+test "InMemoryConfigStorage.initWithCredentials: appid/secret from credential sources" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const DummyFetch = struct {
+        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) token_mod.FetchOutcome {
+            _ = c;
+            _ = i;
+            return .{ .ok = .{ .token = g.dupe(u8, "T") catch return .{ .err = error_mod.WxError.transport(g, "oom", .{}) }, .expires_in = 7200 } };
+        }
+    };
+    const fetcher = token_mod.Fetcher{ .ptr = undefined, .vtable = &.{ .fetch = DummyFetch.f } };
+
+    // 只回显来源标识的 text 源(非真实凭证),保持离线;appid/secret 分别读入。
+    var cfg = try InMemoryConfigStorage.initWithCredentials(gpa, fetcher, io, .{
+        .appid = .{ .text = "wxAPP_FROM_SOURCE" },
+        .secret = .{ .text = "SECRET_FROM_SOURCE" },
+        .token = "TK",
+        .aes_key = "AES",
+    });
+    defer cfg.deinit();
+    const view = cfg.config();
+    try std.testing.expectEqualStrings("wxAPP_FROM_SOURCE", view.appid());
+    try std.testing.expectEqualStrings("SECRET_FROM_SOURCE", view.secret());
+    try std.testing.expectEqualStrings("TK", view.token());
+    try std.testing.expectEqualStrings("AES", view.aesKey());
 }

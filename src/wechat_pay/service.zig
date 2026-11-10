@@ -48,18 +48,53 @@ pub const PayService = struct {
     /// 商户客户端证书提供者接缝(mTLS)。null → 需证书的接口自检报 missing_cert。
     /// 真实双向 TLS 需外部 TLS 栈 + 真实 p12 证书,见 `mtls.zig` 调研结论,不伪造。
     client_cert: ?mtls.CertProvider = null,
+    /// 生产接线(initProduction)持有的堆上真实签名器(由 `cfg.private_key_pem`
+    /// 经 `KeySigner.fromPem` 构造);用毕 `deinit()` 释放。init() 保持 null。
+    owned_signer: ?*sign_mod.KeySigner = null,
+    /// 最近一次 V2 请求的 mTLS 自检结论(对应 Java `post(url, xml, useKey)`
+    /// 显式布尔选通道)。std 无 mTLS 能力,故此处**如实记录**结论而非伪造握手,
+    /// 供生产调用方/离线单测检查;真实双向 TLS 仍需外部栈 + 真凭证。
+    last_mtls_status: mtls.CheckOutcome = .not_required,
 
     pub fn init(gpa: std.mem.Allocator, cfg: *config_mod.PayConfig, exec: RequestExecutor) PayService {
         return .{ .gpa = gpa, .cfg = cfg, .exec = exec };
     }
 
-    /// 发请求前的 mTLS 自检接缝(对应 Java `post(url, xml, true)` 的 useCertificate):
-    /// 返回 `mtls.CheckOutcome`,调用方可据此决定是否继续。纯逻辑、离线可测,
-    /// 不执行真实 TLS 握手(见 mtls.zig)。未注入 provider 时用空占位。
-    pub fn mtlsStatus(self: *PayService, path: []const u8) mtls.CheckOutcome {
+    /// 生产接线构造:注入真实 HTTP 执行器(mp V2 + V3),并从 `cfg.private_key_pem`
+    /// 加载真实 RSA 签名器**替换 `RsaSigner.stub` 默认**,使该字段真正被 V3 请求
+    /// 签名消费(对应 Java `WxPayConfig.getPrivateKey()` → `WechatPay2Credential`)。
+    /// 私钥为空/非法 PEM → 返回 `BadRsaKey`(诚实报错,不再静默用 stub 假装可签)。
+    /// 构造出的服务持有一个堆上 `KeySigner`(地址稳定,可安全按值返回),用毕
+    /// 调 `deinit()`。exec/v3exec 指向调用方持有的真实执行器,须比服务活得久。
+    pub fn initProduction(gpa: std.mem.Allocator, cfg: *config_mod.PayConfig, exec: RequestExecutor, v3exec: v3.RequestExecutor) !PayService {
+        const ks = try gpa.create(sign_mod.KeySigner);
+        errdefer gpa.destroy(ks);
+        ks.* = try sign_mod.KeySigner.fromPem(gpa, cfg.private_key_pem);
+        var svc = PayService.init(gpa, cfg, exec);
+        svc.owned_signer = ks;
+        svc.rsa = ks.signer();
+        svc.v3exec = v3exec;
+        return svc;
+    }
+
+    /// 释放生产接线(initProduction)持有的堆上签名器。init() 构造的服务
+    /// (owned_signer == null)调用它是安全的空操作,不必强制。
+    pub fn deinit(self: *PayService) void {
+        if (self.owned_signer) |ks| {
+            ks.deinit();
+            self.gpa.destroy(ks);
+            self.owned_signer = null;
+        }
+    }
+
+    /// 发请求前的 mTLS 自检接缝(对应 Java `post(url, xml, boolean useKey)`):
+    /// `use_key` 由调用点显式传入(refund/reverse → true、unifiedorder → false),
+    /// **不再解析 URL**(逐字对照 `WxPayServiceApacheHttpImpl.createHttpClient(useKey)`)。
+    /// 返回 `mtls.CheckOutcome`,纯逻辑、离线可测,不执行真实 TLS 握手。
+    pub fn mtlsStatus(self: *PayService, use_key: bool) mtls.CheckOutcome {
         var empty = mtls.InMemoryCertProvider{};
         const provider = self.client_cert orelse empty.provider();
-        return mtls.check(path, provider);
+        return mtls.check(use_key, provider);
     }
 
     /// 把字段列表序列化为带 CDATA 的 <xml> 并签名(sign 字段最后追加)。
@@ -89,7 +124,12 @@ pub const PayService = struct {
         io: std.Io,
         url_path: []const u8,
         extra: []const sign_mod.Field,
+        use_key: bool,
     ) WxResult([]u8) {
+        // 对应 Java `post(url, xml, boolean useKey)`:调用点显式传布尔。
+        // 自检结论如实记录(std 无 mTLS 能力,不伪造"已生效");真实双向 TLS
+        // 需外部 TLS 栈 + 真凭证,见 mtls.zig。
+        self.last_mtls_status = self.mtlsStatus(use_key);
         const gpa = self.gpa;
         const nonce = self.nonce16(io) catch |e|
             return .{ .err = WxError.transport(gpa, "nonce: {s}", .{@errorName(e)}) };
@@ -161,6 +201,8 @@ pub const PayService = struct {
     /// V2 统一下单(代表接口)。对应 `createOrder(WxPayUnifiedOrderRequest)`。
     /// 返回响应**原始 xml**(调用方释放);已就地完成验签(失败 → 错误)。
     pub fn unifiedOrder(self: *PayService, io: std.Io, out_trade_no: []const u8, total_fee: []const u8, body: []const u8) WxResult([]u8) {
+        // 对应 Java unifiedOrder → post(url, xml, false):普通通道,不需商户证书。
+        self.last_mtls_status = self.mtlsStatus(false);
         const nonce = self.nonce16(io) catch |e|
             return .{ .err = WxError.transport(self.gpa, "nonce: {s}", .{@errorName(e)}) };
         defer self.gpa.free(nonce);
@@ -205,7 +247,7 @@ pub const PayService = struct {
             .{ .key = "out_trade_no", .value = args.out_trade_no },
             .{ .key = "transaction_id", .value = args.transaction_id },
         };
-        const resp = switch (self.v2Post(io, v2_mod.url.order_query, &fields)) {
+        const resp = switch (self.v2Post(io, v2_mod.url.order_query, &fields, false)) {
             .ok => |r| r,
             .err => |e| return .{ .err = e },
         };
@@ -216,7 +258,7 @@ pub const PayService = struct {
     /// 对应 `closeOrder(outTradeNo)`。POST /pay/closeorder。
     pub fn closeOrder(self: *PayService, io: std.Io, out_trade_no: []const u8) WxResult(v2_mod.BaseResult) {
         const fields = [_]sign_mod.Field{.{ .key = "out_trade_no", .value = out_trade_no }};
-        const resp = switch (self.v2Post(io, v2_mod.url.close_order, &fields)) {
+        const resp = switch (self.v2Post(io, v2_mod.url.close_order, &fields, false)) {
             .ok => |r| r,
             .err => |e| return .{ .err = e },
         };
@@ -225,12 +267,12 @@ pub const PayService = struct {
     }
 
     /// 对应 `reverse(outTradeNo)`。POST /secapi/pay/reverse。
-    /// mTLS:Java `post(url, xml, true)` 需商户证书。Zig 侧 `mtlsStatus(path)` 提供
-    /// 自检接缝(需证书路径判定 + 证书配置检查);真实双向 TLS 需外部 TLS 栈 +
-    /// 真实 p12 证书 + 网络验证,见 `mtls.zig`,不伪造。协议层(签名/XML)已完整。
+    /// mTLS:Java `post(url, xml, true)` 需商户证书 —— 本调用点显式传 `use_key=true`
+    /// (见下面 v2Post),自检结论记入 `last_mtls_status`;真实双向 TLS 需外部 TLS 栈
+    /// + 真实 p12 证书 + 网络验证,见 `mtls.zig`,不伪造。协议层(签名/XML)已完整。
     pub fn reverse(self: *PayService, io: std.Io, out_trade_no: []const u8) WxResult(v2_mod.BaseResult) {
         const fields = [_]sign_mod.Field{.{ .key = "out_trade_no", .value = out_trade_no }};
-        const resp = switch (self.v2Post(io, v2_mod.url.reverse, &fields)) {
+        const resp = switch (self.v2Post(io, v2_mod.url.reverse, &fields, true)) {
             .ok => |r| r,
             .err => |e| return .{ .err = e },
         };
@@ -239,7 +281,7 @@ pub const PayService = struct {
     }
 
     /// 对应 `refund(WxPayRefundRequest)` 常用字段子集。POST /secapi/pay/refund。
-    /// mTLS:同 `reverse`,`mtlsStatus(path)` 自检 + `mtls.zig` 协议层接缝;
+    /// mTLS:同 `reverse`,调用点显式传 `use_key=true` 并经 `mtls.zig` 协议层自检;
     /// 当前执行器仅发普通 HTTPS,真实双向 TLS 通道待接(不伪造已生效)。
     pub const RefundArgs = struct {
         out_trade_no: []const u8 = "",
@@ -265,7 +307,7 @@ pub const PayService = struct {
         };
         // refund_url 常量与 v2_mod.url.refund 同值,保留旧常量以兼容既有引用点。
         _ = refund_url;
-        const resp = switch (self.v2Post(io, v2_mod.url.refund, &fields)) {
+        const resp = switch (self.v2Post(io, v2_mod.url.refund, &fields, true)) {
             .ok => |r| r,
             .err => |e| return .{ .err = e },
         };
@@ -288,7 +330,7 @@ pub const PayService = struct {
             .{ .key = "out_refund_no", .value = args.out_refund_no },
             .{ .key = "refund_id", .value = args.refund_id },
         };
-        const resp = switch (self.v2Post(io, v2_mod.url.refund_query, &fields)) {
+        const resp = switch (self.v2Post(io, v2_mod.url.refund_query, &fields, false)) {
             .ok => |r| r,
             .err => |e| return .{ .err = e },
         };
@@ -339,8 +381,8 @@ pub const PayService = struct {
 
     /// 与 v3Send 同链路,但返回**带响应头**的完整 `Response`(经 `executeEx`)。
     /// 这是 V3 应答验签的取头入口:调用方拿到后可传给 `verifyV3ResponseFrom`。
-    /// 真实 std.http 通道当前回传空头(fetch 仅给 status,详见 v3.HttpExecutor 注释),
-    /// 需真实网络 + 真实平台证书才能完成真联调;此处为协议层/接缝。
+    /// 工具链重核(dev.954):真实 `v3.HttpExecutor` 改走 `mp_http.httpRequest`
+    /// 低层抓头,现也会回传 `Wechatpay-*`;真联调仍需真实网络 + 真实平台证书。
     pub fn v3SendEx(
         self: *PayService,
         io: std.Io,
@@ -1412,21 +1454,115 @@ test "PayService.mtlsStatus: honest missing_cert / not_required / present" {
     var stub = mp_http.StubExecutor.init(gpa, &.{});
     var pay = PayService.init(gpa, &cfg, stub.executor());
 
-    // 未注入证书提供者:需证书的接口报 missing_cert(不伪造成功)
-    switch (pay.mtlsStatus(v2_mod.url.refund)) {
+    // use_key=true(Java refund/reverse)+ 未注入证书提供者 → missing_cert(不伪造成功)
+    switch (pay.mtlsStatus(true)) {
         .missing_cert => {},
         else => return error.UnexpectedMtls,
     }
-    // 普通接口:not_required
-    switch (pay.mtlsStatus("/pay/unifiedorder")) {
+    // use_key=false(Java unifiedorder)→ not_required(与证书无关)
+    switch (pay.mtlsStatus(false)) {
         .not_required => {},
         else => return error.UnexpectedMtls,
     }
     // 注入配置了证书的 provider -> transport_unsupported(配置齐全但 std 无 mTLS)
     var provider = mtls.InMemoryCertProvider{ .cert = .{ .mch_id = "19000", .key_string = "BASE64_P12" } };
     pay.client_cert = provider.provider();
-    switch (pay.mtlsStatus(v2_mod.url.reverse)) {
+    switch (pay.mtlsStatus(true)) {
         .cert_present_transport_unsupported => |c| try std.testing.expectEqualStrings("BASE64_P12", c.key_string),
         else => return error.UnexpectedMtls,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 生产接线:private_key_pem 被真实签名器消费 + 真实执行器注入(离线单测)
+// ---------------------------------------------------------------------------
+
+test "PayService.initProduction: private_key_pem consumed by real signer, real executors wired" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try config_mod.PayConfig.init(gpa, .{
+        .appid = "wxp",
+        .mch_id = "1900010",
+        .cert_serial_no = "SERIAL1",
+    });
+    defer cfg.deinit();
+    // 经凭证源把内嵌测试私钥(非真实凭证)加载进 private_key_pem。
+    try cfg.loadPrivateKey(io, .{ .text = sign_mod.TEST_PRIV_PEM });
+
+    var mp_http_exec = mp_http.HttpExecutor.init(gpa, io);
+    var v3_http_exec = v3.HttpExecutor.init(gpa, io);
+    var pay = try PayService.initProduction(gpa, &cfg, mp_http_exec.executor(), v3_http_exec.executor());
+    defer pay.deinit();
+
+    // 真实执行器已注入(回传应答头),pay 调用不再只有 mock 可用。
+    try std.testing.expect(pay.v3exec.?.vtable.execute_ex != null);
+    // rsa 不再是 stub:真签名 + 公钥验证闭环 ⇒ private_key_pem 真正被消费。
+    const msg = "POST\n/v3/pay/transactions/jsapi\n1700000000\nNONCE\n{}\n";
+    const sig = pay.rsa.sign(gpa, msg) catch return error.UnexpectedSignError;
+    defer gpa.free(sig);
+    try std.testing.expect(try sign_mod.verifyWithPublicKeyPem(gpa, sign_mod.TEST_PUB_PEM, msg, sig));
+}
+
+test "PayService.initProduction: empty private_key_pem -> BadRsaKey (no silent stub)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try config_mod.PayConfig.init(gpa, .{ .appid = "wxp", .mch_id = "1900010" });
+    defer cfg.deinit();
+    var mp_http_exec = mp_http.HttpExecutor.init(gpa, io);
+    var v3_http_exec = v3.HttpExecutor.init(gpa, io);
+    // 未加载私钥:诚实报 BadRsaKey,而不是留 RsaSigner.stub 假装能签名。
+    try std.testing.expectError(error.BadRsaKey, PayService.initProduction(gpa, &cfg, mp_http_exec.executor(), v3_http_exec.executor()));
+}
+
+test "V2 call sites pass explicit use_key: refund/reverse=true, unifiedorder=false" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try mkCfg(gpa);
+    defer cfg.deinit();
+    const ok_fields = [_]sign_mod.Field{
+        .{ .key = "return_code", .value = "SUCCESS" },
+        .{ .key = "result_code", .value = "SUCCESS" },
+    };
+
+    // 未注入证书提供者:refund/reverse(Java post(...,true))应记录 missing_cert;
+    // unifiedorder(post(...,false))应记录 not_required。逐一走请求(mock 执行器)。
+    {
+        var m = V2Mock{ .cfg = &cfg, .want = "/secapi/pay/refund", .resp = &ok_fields };
+        defer m.deinitCaps(gpa);
+        var pay = PayService.init(gpa, &cfg, m.executor());
+        switch (pay.refund(io, .{ .out_refund_no = "R1", .total_fee = "1", .refund_fee = "1" })) {
+            .ok => |*r| { var x = r.*; defer x.deinit(); },
+            .err => |*e| { var x = e.*; defer x.deinit(); },
+        }
+        switch (pay.last_mtls_status) { .missing_cert => {}, else => return error.UnexpectedMtls }
+    }
+    {
+        var m = V2Mock{ .cfg = &cfg, .want = "/secapi/pay/reverse", .resp = &ok_fields };
+        defer m.deinitCaps(gpa);
+        var pay = PayService.init(gpa, &cfg, m.executor());
+        switch (pay.reverse(io, "T1")) {
+            .ok => |*r| { var x = r.*; defer x.deinit(); },
+            .err => |*e| { var x = e.*; defer x.deinit(); },
+        }
+        switch (pay.last_mtls_status) { .missing_cert => {}, else => return error.UnexpectedMtls }
+    }
+    {
+        var m = V2Mock{ .cfg = &cfg, .want = "/pay/unifiedorder", .resp = &ok_fields };
+        defer m.deinitCaps(gpa);
+        var pay = PayService.init(gpa, &cfg, m.executor());
+        switch (pay.unifiedOrder(io, "T1", "1", "goods")) {
+            .ok => |b| gpa.free(b),
+            .err => |*e| { var x = e.*; defer x.deinit(); },
+        }
+        switch (pay.last_mtls_status) { .not_required => {}, else => return error.UnexpectedMtls }
     }
 }

@@ -6,10 +6,12 @@
 //! 因此这里定义**带 header 的执行器 vtable**;真实实现 `HttpExecutor` 用 std.http fetch
 //! 的 `extra_headers` 注入,测试可用 mock 捕获 header 断言格式。
 //!
-//! 应答验签:V3 应答头 `Wechatpay-*` 经 vtable 新增的 `execute_ex` 回传(设计一次
-//! 铺开),由本文件协议层 `verifyResponse` 接成「拼验签串 + 签名验证」的接缝。
-//! 真实 std.http 通道当前不回传应答头(fetch 仅给 status,见 HttpExecutor 注释),
-//! 属需真实网络验证的接缝,不伪造验签结果。
+//! 应答验签:V3 应答头 `Wechatpay-*` 经 `execute_ex` 回传,由本文件协议层
+//! `verifyResponse` 接成「拼验签串 + 签名验证」的接缝。工具链重核
+//! (0.18.0-dev.954):`fetch` 只给 status,故真实 `HttpExecutor.executeExImpl`
+//! 改走 `mp_http.httpRequest`(request/receiveHead 抓 head.bytes)回传响应头,
+//! V3 验签链路已从「只有 mock 有头」打通到真实通道;真联调仍需真实网络 +
+//! 真实平台证书,不伪造验签结果。
 //!
 //! ⚠️ mTLS 缺口:V2 的 /secapi/* 与申请平台证书都需要商户证书双向 TLS,
 //! `std.http` 目前不支持客户端证书 —— 真实通道留 TODO,签名/加密协议层已完整可用。
@@ -77,42 +79,40 @@ pub const HttpExecutor = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    fn executeImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: Method, uri: []const u8, headers: []const RequestExecutor.Header, body: ?[]const u8) WxResult([]u8) {
+    /// 真实执行:带 Authorization 等请求头 + 回传 `Response{body,headers}`。
+    /// 工具链重核(dev.954):`fetch` 只给 status,故改走 `mp_http.httpRequest`
+    /// (低层 request/receiveHead,在 reader 前抓 head.bytes),使 V3 应答验签
+    /// 的 `Wechatpay-*` 头在真实通道也拿得到,不再局限于 mock。
+    /// TODO(mTLS): std.http 无客户端证书支持;需双向 TLS 的接口仍待外部 TLS 栈。
+    fn executeExImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: Method, uri: []const u8, headers: []const RequestExecutor.Header, body: ?[]const u8) WxResult(Response) {
         _ = ctx;
-        // TODO(mTLS): std.http 无客户端证书支持;若接口需双向 TLS 需接第三方 TLS 栈。
-        var client = std.http.Client{ .allocator = gpa, .io = io };
-        defer client.deinit();
-
         var extra = std.ArrayList(std.http.Header).empty;
         defer extra.deinit(gpa);
         for (headers) |h| extra.append(gpa, .{ .name = h.name, .value = h.value }) catch
             return .{ .err = WxError.transport(gpa, "oom", .{}) };
 
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        errdefer out.deinit();
-
-        const res = client.fetch(.{
-            .location = .{ .url = uri },
-            .method = switch (method) {
-                .get => .GET,
-                .post => .POST,
-            },
-            .payload = body,
-            .extra_headers = extra.items,
-            .response_writer = &out.writer,
-        }) catch |e| return .{ .err = WxError.transport(gpa, "v3 http {s} {s}: {s}", .{ @tagName(method), uri, @errorName(e) }) };
-        const resp_body = out.toOwnedSlice() catch |e| return .{
-            .err = WxError.transport(gpa, "v3 response buffer: {s}", .{@errorName(e)}),
-        };
-        // 非 2xx 并入错误(与 mp/http.zig HttpExecutor 同步的骨架约定)。
-        if (foldHttpStatus(gpa, res.status.class() == .success, @backingInt(res.status), resp_body)) |we| {
-            gpa.free(resp_body);
+        const raw = mp_http.httpRequest(gpa, io, method, uri, extra.items, body) catch |e|
+            return .{ .err = WxError.transport(gpa, "v3 http {s} {s}: {s}", .{ @tagName(method), uri, @errorName(e) }) };
+        const status = raw.status;
+        // 非 2xx 并入错误(与 mp/http.zig HttpExecutor 同步的约定)。
+        if (foldHttpStatus(gpa, status.class() == .success, @backingInt(status), raw.body)) |we| {
+            raw.deinit(gpa);
             return .{ .err = we };
         }
-        return .{ .ok = resp_body };
+        // 所有权转移给 Response(调用方 deinit)。
+        return .{ .ok = .{ .body = raw.body, .headers = raw.headers } };
     }
 
-    const vtable = RequestExecutor.VTable{ .execute = executeImpl };
+    /// 只要 body 的兼容路径:委托 executeExImpl 后 `takeBody`(释放响应头、返回 body)。
+    fn executeImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: Method, uri: []const u8, headers: []const RequestExecutor.Header, body: ?[]const u8) WxResult([]u8) {
+        return switch (executeExImpl(ctx, gpa, io, method, uri, headers, body)) {
+            .err => |e| .{ .err = e },
+            .ok => |r| .{ .ok = r.takeBody(gpa) },
+        };
+    }
+
+    /// 真实 V3 通道现在也回传应答头(execute_ex),V3 应答验签链路接通。
+    const vtable = RequestExecutor.VTable{ .execute = executeImpl, .execute_ex = executeExImpl };
 };
 
 /// V3 应答错误({"code":..,"message":..})→ WxError。
@@ -181,8 +181,8 @@ pub fn verifyWithPublicKeyPem(
 // 这是「接缝」:把 `RequestExecutor.executeEx` 回传的 `Response{body,headers}`
 // 接成 WxPayValidator.validate 的完整判定链。平台证书公钥是**凭证**,由调用方
 // 注入(`platform_pub_pem`),本层老老实实调 `sign.verifyWithPublicKeyPem` 做真实
-// RSA 验签,不伪造「验证通过」结果。真实 std.http 通道目前不回传应答头(见
-// HttpExecutor 注释),故此处离线可测,真联调需真实网络 + 真实平台证书。
+// RSA 验签,不伪造「验证通过」结果。真实 std.http 通道现已经 `execute_ex`
+// 回传应答头(见 HttpExecutor),协议层离线可测,真联调仍需真实网络 + 真实平台证书。
 // ---------------------------------------------------------------------------
 
 /// 对应 Java `WxPayValidator.DEFAULT_TIMESTAMP_TOLERANCE_SECONDS`(5 分钟)。
@@ -546,4 +546,228 @@ test "verifyResponse protocol seam: verified / tampered / stale / missing / non-
         defer gpa.free(s.sig);
         try expectTag(.skipped_non_json, verifyResponse(gpa, s.resp, sign.TEST_PUB_PEM, 1700000000, 300));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Java WxPayValidatorTest 迁移 + 协议层边界 / vtable 回退
+// ---------------------------------------------------------------------------
+
+test "isTimestampFresh: WxPayValidatorTest.java boundary cases (migrated)" {
+    const now: i64 = 1_700_000_000;
+    const five: i64 = 5 * 60; // 300
+    const ten: i64 = 10 * 60; // 600
+
+    // testDefaultConstructorUsesFiveMinutes:默认容差 = 5 分钟。
+    try std.testing.expectEqual(@as(i64, 300), default_timestamp_tolerance_seconds);
+
+    // testFreshTimestampPasses。
+    try std.testing.expect(isTimestampFresh("1700000000", now, five));
+    // testTimestampAtToleranceBoundaryPasses:now ± 300 都通过(边界含等号,Java Math.abs <= tolerance)。
+    try std.testing.expect(isTimestampFresh("1699999700", now, five)); // now - 300
+    try std.testing.expect(isTimestampFresh("1700000300", now, five)); // now + 300
+    // testStaleTimestampIsRejected:now - 360。
+    try std.testing.expect(!isTimestampFresh("1699999640", now, five));
+    // testFutureTimestampIsRejected:now + 360。
+    try std.testing.expect(!isTimestampFresh("1700000360", now, five));
+    // testNonNumericTimestampIsRejected。
+    try std.testing.expect(!isTimestampFresh("not-a-number", now, five));
+    // testNegativeTimestampIsRejected:-1 与「减法溢出成负」的 Long.MIN_VALUE+now。
+    try std.testing.expect(!isTimestampFresh("-1", now, five));
+    try std.testing.expect(!isTimestampFresh("-9223372035154775808", now, five));
+    // testCustomToleranceIsHonoured:容差放宽到 600,滞后 360 通过。
+    try std.testing.expect(isTimestampFresh("1699999640", now, ten));
+    // testZeroToleranceDisablesTimestampCheck:容差 0 关闭校验,连非法/负值时间戳都不再解析。
+    try std.testing.expect(isTimestampFresh("1699999400", now, 0)); // now - 600
+    try std.testing.expect(isTimestampFresh("not-a-number", now, 0));
+    try std.testing.expect(isTimestampFresh("-1", now, 0));
+}
+
+test "v3 result objects fromJson + deinit; VerifyOutcome.passed()" {
+    const gpa = std.testing.allocator;
+    {
+        var p = try json_util.parse(gpa, "{\"prepay_id\":\"wx1\"}");
+        defer p.deinit();
+        var r = try JsapiOrderResult.fromJson(gpa, p.value);
+        defer r.deinit();
+        try std.testing.expectEqualStrings("wx1", r.prepay_id);
+    }
+    {
+        // 空值边界:缺 prepay_id -> 空串,deinit 不重复释放。
+        var p = try json_util.parse(gpa, "{}");
+        defer p.deinit();
+        var r = try JsapiOrderResult.fromJson(gpa, p.value);
+        defer r.deinit();
+        try std.testing.expectEqualStrings("", r.prepay_id);
+    }
+    {
+        var p = try json_util.parse(gpa, "{\"trade_state\":\"SUCCESS\",\"trade_state_desc\":\"ok\",\"out_trade_no\":\"T1\",\"transaction_id\":\"TX1\",\"success_time\":\"2024-01-01\"}");
+        defer p.deinit();
+        var r = try OrderResult.fromJson(gpa, p.value);
+        defer r.deinit();
+        try std.testing.expectEqualStrings("SUCCESS", r.trade_state);
+        try std.testing.expectEqualStrings("ok", r.trade_state_desc);
+        try std.testing.expectEqualStrings("T1", r.out_trade_no);
+        try std.testing.expectEqualStrings("TX1", r.transaction_id);
+        try std.testing.expectEqualStrings("2024-01-01", r.success_time);
+    }
+    {
+        // 全字段缺失 -> 5 个空串,deinit 逐字段 free 不崩。
+        var p = try json_util.parse(gpa, "{}");
+        defer p.deinit();
+        var r = try OrderResult.fromJson(gpa, p.value);
+        defer r.deinit();
+        try std.testing.expectEqualStrings("", r.trade_state);
+        try std.testing.expectEqualStrings("", r.success_time);
+    }
+    // VerifyOutcome.passed():仅 verified / skipped_non_json 视为「应答有效」。
+    // 用带明确类型的数组元素把无载荷 tag 强制成 union 值(裸 VerifyOutcome.verified 是枚举 tag)。
+    const outcomes = [_]VerifyOutcome{
+        .verified,
+        .skipped_non_json,
+        .missing_header,
+        .invalid_timestamp,
+        .stale_timestamp,
+        .signature_mismatch,
+        .{ .crypto_error = error.OutOfMemory },
+    };
+    const want_passed = [_]bool{ true, true, false, false, false, false, false };
+    for (outcomes, want_passed) |o, w| try std.testing.expectEqual(w, o.passed());
+}
+
+test "v3ErrorFromJson / buildVerifyString / isJsonContentType edge cases" {
+    const gpa = std.testing.allocator;
+    // V3 错误体缺 message / message 非字符串 -> null。
+    try std.testing.expect(v3ErrorFromJson(gpa, "{\"code\":\"X\"}") == null);
+    try std.testing.expect(v3ErrorFromJson(gpa, "{\"code\":\"X\",\"message\":123}") == null);
+    try std.testing.expect(v3ErrorFromJson(gpa, "") == null);
+    try std.testing.expect(v3ErrorFromJson(gpa, "<xml/>") == null);
+
+    // 验签串空段:仍保持 timestamp\nnonce\nbody\n 形状。
+    const msg = try buildVerifyString(gpa, "", "", "");
+    defer gpa.free(msg);
+    try std.testing.expectEqualStrings("\n\n\n", msg);
+
+    // Content-Type:只取 mime 段、大小写不敏感、容忍首尾空白;近似值不命中。
+    try std.testing.expect(isJsonContentType(" application/json ; charset=utf-8"));
+    try std.testing.expect(isJsonContentType("APPLICATION/JSON"));
+    try std.testing.expect(!isJsonContentType("application/jsonx"));
+    try std.testing.expect(!isJsonContentType("text/json"));
+    try std.testing.expect(!isJsonContentType("application/xml"));
+    try std.testing.expect(!isJsonContentType(""));
+}
+
+test "foldHttpStatus: remaining non-2xx branches" {
+    const gpa = std.testing.allocator;
+    // 非 2xx + V3 错误但缺 message -> 不是合法错误报文、也无 errcode/<xml> -> transport。
+    {
+        var e = foldHttpStatus(gpa, false, 401, "{\"code\":\"SIGN_ERROR\"}").?;
+        defer e.deinit();
+        try std.testing.expectEqual(WxError.Source.transport, e.source);
+    }
+    // 非 2xx + 非对象 JSON -> transport。
+    {
+        var e = foldHttpStatus(gpa, false, 500, "[1,2,3]").?;
+        defer e.deinit();
+        try std.testing.expectEqual(WxError.Source.transport, e.source);
+    }
+    // 非 2xx + 含 errcode / <xml 的报文 -> null(交上层 Service 折叠)。
+    try std.testing.expect(foldHttpStatus(gpa, false, 400, "{\"errcode\":40001}") == null);
+    try std.testing.expect(foldHttpStatus(gpa, false, 400, "<xml><return_code>FAIL</return_code></xml>") == null);
+}
+
+test "v3 HttpExecutor (real std.http) now implements execute_ex for response headers" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 引用真实执行器(而非 mock)强制分析低层链路;证明 pay 侧 V3 调用现在
+    // 也能注入一条「回传应答头」的真实 std.http 通道,不再只有 mock 有头。
+    var http = HttpExecutor.init(gpa, io);
+    const exec = http.executor();
+    try std.testing.expect(exec.vtable.execute_ex != null);
+}
+
+test "v3 RequestExecutor.executeEx: fallback (no execute_ex) + error propagation" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Only = struct {
+        fn okF(ctx: *anyopaque, g: std.mem.Allocator, ioo: std.Io, m: Method, uri: []const u8, headers: []const RequestExecutor.Header, body: ?[]const u8) WxResult([]u8) {
+            _ = ctx;
+            _ = ioo;
+            _ = m;
+            _ = uri;
+            _ = headers;
+            _ = body;
+            return .{ .ok = g.dupe(u8, "VBODY") catch return .{ .err = WxError.transport(g, "oom", .{}) } };
+        }
+        fn badF(ctx: *anyopaque, g: std.mem.Allocator, ioo: std.Io, m: Method, uri: []const u8, headers: []const RequestExecutor.Header, body: ?[]const u8) WxResult([]u8) {
+            _ = ctx;
+            _ = ioo;
+            _ = m;
+            _ = uri;
+            _ = headers;
+            _ = body;
+            return .{ .err = WxError.transport(g, "boom", .{}) };
+        }
+    };
+    const hdrs = [_]RequestExecutor.Header{};
+
+    // 未覆写 execute_ex -> 回退到 execute,body 正常、响应头为空(诚实不伪造头)。
+    {
+        const exec = RequestExecutor{ .ptr = undefined, .vtable = &.{ .execute = Only.okF } };
+        var r = exec.executeEx(gpa, io, .get, "x", &hdrs, null);
+        switch (r) {
+            .ok => |resp| {
+                var v = resp;
+                defer v.deinit(gpa);
+                try std.testing.expectEqualStrings("VBODY", v.body);
+                try std.testing.expectEqual(@as(usize, 0), v.headers.len);
+            },
+            .err => |*e| {
+                defer e.deinit();
+                return error.UnexpectedV3FallbackOk;
+            },
+        }
+    }
+    // execute 返回 .err -> executeEx 原样透传错误。
+    {
+        const exec = RequestExecutor{ .ptr = undefined, .vtable = &.{ .execute = Only.badF } };
+        var r = exec.executeEx(gpa, io, .get, "x", &hdrs, null);
+        switch (r) {
+            .ok => |resp| {
+                var v = resp;
+                defer v.deinit(gpa);
+                return error.UnexpectedV3FallbackErr;
+            },
+            .err => |*e| {
+                defer e.deinit();
+                try std.testing.expectEqual(WxError.Source.transport, e.source);
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// isJsonContentType: 畸形/边界值(可测边界,纯函数离线覆盖)
+// ---------------------------------------------------------------------------
+
+test "isJsonContentType: malformed values are rejected honestly" {
+    // 只有第一个 ';' 之前的 mime 段参与判定,参数区一律忽略。
+    try std.testing.expect(!isJsonContentType(";charset=utf-8")); // 只有参数,缺 mime
+    try std.testing.expect(!isJsonContentType(";")); // 空 mime
+    try std.testing.expect(!isJsonContentType("text/plain;application/json")); // 参数里夹 json 不认
+    // trim 只去空格/tab;CR/LF 等畸形空白不被规范化 -> 保守判为非 JSON(跳过验签)。
+    try std.testing.expect(!isJsonContentType("application/json\r\n"));
+    try std.testing.expect(!isJsonContentType("application/json\n"));
+    // mime 内部空格不被归一化。
+    try std.testing.expect(!isJsonContentType("application / json"));
+    // NUL 等控制字符夹带 -> 非 JSON。
+    try std.testing.expect(!isJsonContentType("application/json\x00"));
+    // 带空/畸形参数段,只要 mime 段合法仍是 JSON(semi 后内容忽略)。
+    try std.testing.expect(isJsonContentType("application/json;"));
+    try std.testing.expect(isJsonContentType("application/json; charset=garbage=1"));
 }

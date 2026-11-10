@@ -8,7 +8,10 @@
 //! | weixin-java-open       | `wechat_open/`        | 第三方平台（开放平台）       |
 //! | weixin-java-pay        | `wechat_pay/`         | 微信支付                     |
 //!
-//! 骨架阶段目标：复刻 Java 的**架构设计与公共方法**，而非逐个 API。
+//! 目标(用户明确声明)：与仓库内 WxJava **同样的设计架构与 API 形状**,并朝
+//! 生产可用推进 —— 以对齐 WxJava 的行为/API 为评判标准,不再以「骨架只复刻
+//! 架构与公共方法」为范围上限。当前范围仍聚焦 common/mp/miniapp/open/pay 五模块
+//! (cp/channel/store/qidian 的补齐待拍板),但每个模块内的实现以「生产可用」为准绳。
 const std = @import("std");
 
 // ---- common：公共底座（build.zig 模块名 "common"）----
@@ -23,6 +26,7 @@ pub const random = @import("common").random;
 pub const duplicate = @import("common").duplicate;
 pub const session = @import("common").session;
 pub const redis_ops = @import("common").redis_ops;
+pub const credentials = @import("common").credentials;
 
 pub const crypt = struct {
     pub const aes_mode = @import("common").crypt.aes_mode;

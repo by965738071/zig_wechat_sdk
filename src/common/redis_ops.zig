@@ -407,6 +407,90 @@ test "getLock: PX lease auto-release after expiry (controllable clock)" {
 }
 
 // ---------------------------------------------------------------------------
+// KV 过期 / SETNX 无过期 / compare-and-delete 的边界分支
+// ---------------------------------------------------------------------------
+
+test "redis ops: getExpire/expire, TTL expiry, missing-key error" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+
+    var r = InMemoryRedis.init(gpa);
+    defer r.deinit();
+    var clock = TestClock{};
+    clock.install(&r);
+    const ops = r.redis();
+
+    // setValue 带 60s TTL -> getExpire=60、getValue 命中。
+    try ops.setValue(gpa, io, "k", "v", 60);
+    try std.testing.expectEqual(@as(i64, 60), (try ops.getExpire(io, "k")).?);
+    const got = (try ops.getValue(gpa, io, "k")).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("v", got);
+
+    // 推进可控时钟超过 TTL -> getValue/getExpire 都视为不存在(惰性过期)。
+    clock.now_ns += 61 * std.time.ns_per_s;
+    try std.testing.expect((try ops.getValue(gpa, io, "k")) == null);
+    try std.testing.expect((try ops.getExpire(io, "k")) == null);
+
+    // expire 一个不存在的 key -> RedisUnavailable(对应 vtable 的错误分支)。
+    try std.testing.expectError(error.RedisUnavailable, ops.expire(io, "missing", 10));
+
+    // expire_seconds<=0 表示永不过期;随后 expire() 可重新挂 TTL。
+    try ops.setValue(gpa, io, "k2", "v2", 0);
+    try std.testing.expect((try ops.getExpire(io, "k2")) == null);
+    try ops.expire(io, "k2", 30);
+    try std.testing.expectEqual(@as(i64, 30), (try ops.getExpire(io, "k2")).?);
+}
+
+test "setIfAbsent: lease_ms=0 never expires (SETNX without PX)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+
+    var r = InMemoryRedis.init(gpa);
+    defer r.deinit();
+    var clock = TestClock{};
+    clock.install(&r);
+
+    try std.testing.expect(try r.setIfAbsent(gpa, io, "lock", "owner", 0));
+    // 推进很久也不会过期 -> 再次 SETNX 仍失败(不覆盖)。
+    clock.now_ns += 10_000 * std.time.ns_per_s;
+    try std.testing.expect(!(try r.setIfAbsent(gpa, io, "lock", "other", 0)));
+    const v = (try r.redis().getValue(gpa, io, "lock")).?;
+    defer gpa.free(v);
+    try std.testing.expectEqualStrings("owner", v);
+}
+
+test "compareAndDelete: wrong value / correct / missing" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+
+    var r = InMemoryRedis.init(gpa);
+    defer r.deinit();
+    var clock = TestClock{};
+    clock.install(&r);
+
+    try std.testing.expect(try r.setIfAbsent(gpa, io, "lock", "owner-A", 5000));
+    // 非持有者 expected 不匹配 -> 不删(对应 Java unlock Lua 脚本)。
+    try std.testing.expect(!r.compareAndDelete(io, "lock", "WRONG"));
+    const v = (try r.redis().getValue(gpa, io, "lock")).?;
+    defer gpa.free(v);
+    try std.testing.expectEqualStrings("owner-A", v);
+
+    // 正确 owner -> 删除。
+    try std.testing.expect(r.compareAndDelete(io, "lock", "owner-A"));
+    try std.testing.expect((try r.redis().getValue(gpa, io, "lock")) == null);
+    // 已删除 / 不存在的 key -> false。
+    try std.testing.expect(!r.compareAndDelete(io, "lock", "owner-A"));
+    try std.testing.expect(!r.compareAndDelete(io, "never", "x"));
+}
+
+// ---------------------------------------------------------------------------
 // 选型结论(跨进程真 Redis):
 // 本 InMemoryRedis 用 `std.StringHashMap + std.Io.Mutex` 在**单进程内**逼真模拟
 // SETNX+PX / compare-and-delete,`RedisOps` vtable 已是接入接缝。跨进程部署需一个
@@ -421,3 +505,83 @@ test "getLock: PX lease auto-release after expiry (controllable clock)" {
 // 不新增外部 crate(网络依赖无法离线验证、也会给纯离线测试引入不稳定),仅把
 // `WxRedisOps` 接口 + 内存参考实现做实并离线单测,选型建议如上。
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 真线程:redisTryLock 自旋超时 / OOM 失败回退(noop_lock_vtable)
+// ---------------------------------------------------------------------------
+
+/// 确定性「步进时钟」:每次 nowNs 读取固定前进 step_ns,使 redisTryLock 自旋
+/// 累计的 (now - start) 必然在有限步内越过预算 -> 返回 false,不依赖真实时间流逝。
+/// 只在单个 worker 线程内被访问(main 预置持有者后即 await,期间不碰时钟)。
+const AdvancingClock = struct {
+    now_ns: i96 = 1_700_000_000 * std.time.ns_per_s,
+    step_ns: i96 = 1 * std.time.ns_per_ms,
+    fn f(c: *anyopaque, io: std.Io) i96 {
+        _ = io;
+        const self: *@This() = @ptrCast(@alignCast(c));
+        const cur = self.now_ns;
+        self.now_ns += self.step_ns;
+        return cur;
+    }
+};
+
+fn redisContender(r: *InMemoryRedis, io: std.Io, out: *bool) void {
+    const l = r.redis().getLock("locked");
+    out.* = l.tryLock(io, 5); // 小预算自旋超时
+}
+
+test "concurrency: redisTryLock spins then times out (real thread, step clock)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+
+    var r = InMemoryRedis.init(gpa);
+    defer r.deinit();
+    var clock = AdvancingClock{};
+    r.now_fn = AdvancingClock.f;
+    r.now_ctx = @ptrCast(&clock);
+
+    // 预置一个不属于 contender 的持有者:SETNX 失败、非重入,
+    // 迫使 redisTryLock 进入 while+sleep 自旋直到预算耗尽。
+    try std.testing.expect(try r.setIfAbsent(gpa, io, "locked", "HOLDER", 0));
+
+    var out = false;
+    var fut = try io.concurrent(redisContender, .{ &r, io, &out });
+    _ = fut.await(io);
+
+    try std.testing.expect(!out); // 自旋超时 -> 拿不到锁(诚实返回 false)
+    // 持有者未被误删:compare-and-delete 只认自己的 owner。
+    try std.testing.expect(r.compareAndDelete(io, "locked", "HOLDER"));
+}
+
+test "getLockImpl: OOM falls back to honest noop lock (never acquires)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+
+    // 逐点注入 OOM:getLockImpl 里 create/dupe/allocPrint/append 任一失败,
+    // 都应退化为 noop_lock_vtable(永远拿不到锁,不伪造成功),且部分分配
+    // 由各 errdefer 分支清干净(底层 testing.allocator 兜底检测泄漏)。
+    var induced_count: usize = 0;
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |fail_at| {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        const fa = failing.allocator();
+        var r = InMemoryRedis.init(fa);
+        defer r.deinit();
+
+        const l = r.redis().getLock("res");
+        const induced = failing.has_induced_failure;
+        // 隔离:后续 tryLock 的 setIfAbsent 不再受注入影响,只检验 getLock 的回退结果。
+        failing.fail_index = std.math.maxInt(usize);
+        if (induced) {
+            induced_count += 1;
+            try std.testing.expect(!l.tryLock(io, 0)); // noop 永不成功
+        } else {
+            try std.testing.expect(l.tryLock(io, 0)); // 正常锁
+            l.unlock(io);
+        }
+    }
+    try std.testing.expect(induced_count >= 1); // 确认 OOM 回退路径确实被走到
+}

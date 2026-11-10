@@ -374,3 +374,144 @@ test "WxError fromJson translates per business line" {
         try std.testing.expectEqualStrings("invalid credential", e.error_msg);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Java WxErrorTest 迁移 + 构造函数 / 非 JSON 分支 / 码表边界
+// ---------------------------------------------------------------------------
+
+test "WxError.fromJson tolerates extra/missing fields (WxErrorTest.java)" {
+    const gpa = std.testing.allocator;
+    // testFromJson:errcode 40003 + errmsg。
+    {
+        var e = try WxError.fromJson(gpa, "{ \"errcode\": 40003, \"errmsg\": \"invalid openid\" }", .mp);
+        defer e.deinit();
+        try std.testing.expectEqual(@as(i64, 40003), e.error_code);
+        try std.testing.expectEqualStrings("invalid openid", e.error_msg_en);
+    }
+    // testFromBadJson1:多余字段 media_id 被忽略,断言不变。
+    {
+        var e = try WxError.fromJson(gpa, "{ \"errcode\": 40003, \"errmsg\": \"invalid openid\", \"media_id\": \"123\" }", .mp);
+        defer e.deinit();
+        try std.testing.expectEqual(@as(i64, 40003), e.error_code);
+        try std.testing.expectEqualStrings("invalid openid", e.error_msg_en);
+    }
+    // testFromBadJson2:无 errcode/errmsg -> code 0、errmsg_en 空。
+    // 注:Java WxError.fromJson 在 errcode==0 时直接 return、errorMsg 为 null;
+    // Zig 侧 lookupHint(.mp,0) 会翻成「请求成功」——该 WxError 在 token/ticket
+    // 拉取路径上 err.error_code==0 时会被立即丢弃,属无害差异,如实标注不改生产逻辑。
+    {
+        var e = try WxError.fromJson(gpa, "{\"access_token\":\"ACCESS_TOKEN\",\"expires_in\":7200}", .mp);
+        defer e.deinit();
+        try std.testing.expectEqual(@as(i64, 0), e.error_code);
+        try std.testing.expectEqualStrings("", e.error_msg_en);
+    }
+}
+
+test "WxError.fromJson: non-JSON / non-object keeps raw, default fields" {
+    const gpa = std.testing.allocator;
+    {
+        // 非 JSON 输入不报错,只保留 raw(对应 Java 解析失败仍返回对象)。
+        var e = try WxError.fromJson(gpa, "not json at all", .mp);
+        defer e.deinit();
+        try std.testing.expectEqual(@as(i64, 0), e.error_code);
+        try std.testing.expectEqualStrings("", e.error_msg);
+        try std.testing.expectEqualStrings("", e.error_msg_en);
+        try std.testing.expectEqualStrings("not json at all", e.raw.?);
+    }
+    {
+        // 顶层是数组而非对象 -> 直接返回默认值 + raw。
+        var e = try WxError.fromJson(gpa, "[1,2,3]", .open);
+        defer e.deinit();
+        try std.testing.expectEqual(@as(i64, 0), e.error_code);
+        try std.testing.expectEqualStrings("[1,2,3]", e.raw.?);
+    }
+}
+
+test "WxError.fromJson: float errcode + non-string errmsg" {
+    const gpa = std.testing.allocator;
+    {
+        // errcode 为浮点 -> @intFromFloat 收敛成整型。
+        var e = try WxError.fromJson(gpa, "{\"errcode\":40001.0,\"errmsg\":\"x\"}", .mp);
+        defer e.deinit();
+        try std.testing.expectEqual(@as(i64, 40001), e.error_code);
+    }
+    {
+        // errmsg 非字符串 -> 被忽略,error_msg_en 保持空。
+        var e = try WxError.fromJson(gpa, "{\"errcode\":40001,\"errmsg\":12345}", .mp);
+        defer e.deinit();
+        try std.testing.expectEqual(@as(i64, 40001), e.error_code);
+        try std.testing.expectEqualStrings("", e.error_msg_en);
+    }
+}
+
+test "WxError constructors: source + error_code; WxType.label" {
+    const gpa = std.testing.allocator;
+    {
+        var e = WxError.transport(gpa, "net {s}", .{"down"});
+        defer e.deinit();
+        try std.testing.expectEqual(WxError.Source.transport, e.source);
+        try std.testing.expectEqual(@as(i64, -1), e.error_code);
+        try std.testing.expectEqualStrings("net down", e.error_msg);
+    }
+    {
+        var e = WxError.internal(gpa, "oops", .{});
+        defer e.deinit();
+        try std.testing.expectEqual(WxError.Source.internal, e.source);
+        try std.testing.expectEqual(@as(i64, -99), e.error_code);
+    }
+    {
+        var e = WxError.configError(gpa, "cfg", .{});
+        defer e.deinit();
+        try std.testing.expectEqual(WxError.Source.config, e.source);
+        try std.testing.expectEqual(@as(i64, -99), e.error_code);
+    }
+    {
+        var e = WxError.cryptoError(gpa, "bad key", .{});
+        defer e.deinit();
+        try std.testing.expectEqual(WxError.Source.crypto, e.source);
+        try std.testing.expectEqual(@as(i64, -99), e.error_code);
+    }
+    // WxType.label 六条业务线全覆盖。
+    try std.testing.expectEqualStrings("微信支付", WxType.pay.label());
+    try std.testing.expectEqualStrings("微信公众号", WxType.mp.label());
+    try std.testing.expectEqualStrings("微信小程序", WxType.mini_app.label());
+    try std.testing.expectEqualStrings("微信开放平台", WxType.open.label());
+    try std.testing.expectEqualStrings("企业微信", WxType.cp.label());
+    try std.testing.expectEqualStrings("微信视频号", WxType.channel.label());
+}
+
+// ---------------------------------------------------------------------------
+// OOM / 失败回退:initMsg 的 allocPrint 失败回退
+// ---------------------------------------------------------------------------
+
+test "initMsg: allocPrint OOM falls back to empty error_msg, clean deinit" {
+    // fail_index=0 让 allocPrint 的首次(也是唯一一次)分配失败,
+    // initMsg 的 catch 分支应返回 error_msg="" 的 WxError,而非把静态串当堆内存 free。
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const fa = failing.allocator();
+
+    var e = WxError.transport(fa, "net {s} down", .{"is"});
+    // 回退路径仍保留 source/code 语义,只是没有可读文案。
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(WxError.Source.transport, e.source);
+    try std.testing.expectEqual(@as(i64, -1), e.error_code);
+    try std.testing.expectEqualStrings("", e.error_msg);
+    // deinit 不能对空 error_msg 调 free(否则崩溃);testing.allocator 也检测不到泄漏。
+    e.deinit();
+
+    // 各构造路径都走同一 initMsg 回退:internal / config / crypto。
+    for ([_]WxError.Source{ .internal, .config, .crypto }) |src| {
+        var f2 = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        const fa2 = f2.allocator();
+        var e2 = switch (src) {
+            .internal => WxError.internal(fa2, "x {d}", .{1}),
+            .config => WxError.configError(fa2, "x {d}", .{1}),
+            .crypto => WxError.cryptoError(fa2, "x {d}", .{1}),
+            else => unreachable,
+        };
+        try std.testing.expect(f2.has_induced_failure);
+        try std.testing.expectEqual(src, e2.source);
+        try std.testing.expectEqualStrings("", e2.error_msg);
+        e2.deinit();
+    }
+}

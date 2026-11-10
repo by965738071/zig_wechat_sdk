@@ -143,6 +143,13 @@ pub const Service = struct {
         return .{ .gpa = gpa, .config = cfg, .executor = exec };
     }
 
+    /// 生产接线:注入**真实 std.http 执行器**(调用方持有 `http_exec`,须比 Service
+    /// 活得久)。提供一条不再只有 mock 可用的构造路径;真实网络调用仍需真凭证/环境,
+    /// 离线不可测,故此处只做接线(见 service.zig 的 initWithRealHttp 单测)。
+    pub fn initWithRealHttp(gpa: std.mem.Allocator, cfg: ConfigStorage, http_exec: *http_mod.HttpExecutor) Service {
+        return .{ .gpa = gpa, .config = cfg, .executor = http_exec.executor() };
+    }
+
     /// 对应 `getAccessToken()` / `getAccessToken(boolean forceRefresh)`。
     pub fn getAccessToken(self: *Service, io: std.Io, buf: []u8, force_refresh: bool) WxResult([]const u8) {
         return self.config.acquireAccessToken(io, buf, force_refresh);
@@ -250,20 +257,37 @@ pub const Service = struct {
         return self.call(io, uri, query, data);
     }
 
+    /// 带自定义请求头的 POST(对应 Java `MaterialUploadRequestExecutor` 设置
+    /// `Content-Type: multipart/form-data`)。与 post 同链路(token 附加 + errcode
+    /// 折叠 + 重试),额外把 req_headers 交给 header-capable 执行器。
+    pub fn postWithHeaders(self: *Service, io: std.Io, uri: []const u8, query: []const Query, data: []const u8, req_headers: []const result_mod.Header) WxResult([]u8) {
+        return self.callWithHeaders(io, uri, query, data, req_headers);
+    }
+
     /// 拼 query 后走 execute。
     pub fn call(self: *Service, io: std.Io, uri: []const u8, query: []const Query, body: ?[]const u8) WxResult([]u8) {
-        if (query.len == 0) return self.execute(io, uri, body);
+        return self.callWithHeaders(io, uri, query, body, &.{});
+    }
+
+    fn callWithHeaders(self: *Service, io: std.Io, uri: []const u8, query: []const Query, body: ?[]const u8, req_headers: []const result_mod.Header) WxResult([]u8) {
+        if (query.len == 0) return self.executeWithHeaders(io, uri, body, req_headers);
         const full = buildUrl(self.gpa, uri, query, null) catch |e|
             return .{ .err = WxError.internal(self.gpa, "build url: {s}", .{@errorName(e)}) };
         defer self.gpa.free(full);
-        return self.execute(io, full, body);
+        return self.executeWithHeaders(io, full, body, req_headers);
     }
 
     /// 协议 1:系统繁忙指数退避。
     pub fn execute(self: *Service, io: std.Io, uri: []const u8, body: ?[]const u8) WxResult([]u8) {
+        return self.executeWithHeaders(io, uri, body, &.{});
+    }
+
+    /// 与 execute 同,但携带自定义请求头(重试/token 协议完全一致)。执行器未实现
+    /// `execute_with_headers` 时由 wrapper 回退、忽略请求头,行为与旧版一致。
+    pub fn executeWithHeaders(self: *Service, io: std.Io, uri: []const u8, body: ?[]const u8, req_headers: []const result_mod.Header) WxResult([]u8) {
         var attempt: u32 = 0;
         while (true) {
-            const r = self.executeInternal(io, uri, body, false);
+            const r = self.executeInternal(io, uri, body, false, req_headers);
             switch (r) {
                 .ok => return r,
                 .err => |e| {
@@ -280,7 +304,7 @@ pub const Service = struct {
     }
 
     /// 协议 2:token 附加 + token 失效自动刷新(仅一次)。
-    fn executeInternal(self: *Service, io: std.Io, uri: []const u8, body: ?[]const u8, do_not_auto_refresh: bool) WxResult([]u8) {
+    fn executeInternal(self: *Service, io: std.Io, uri: []const u8, body: ?[]const u8, do_not_auto_refresh: bool, req_headers: []const result_mod.Header) WxResult([]u8) {
         // 对应 Java 直接抛 RuntimeException 的防御:防止 token 泄漏到外部可控 url
         if (std.mem.indexOf(u8, uri, "access_token=") != null) {
             return .{ .err = WxError.internal(self.gpa, "uri 不能自带 access_token: {s}", .{uri}) };
@@ -296,16 +320,20 @@ pub const Service = struct {
             return .{ .err = WxError.internal(self.gpa, "build url: {s}", .{@errorName(e)}) };
         defer self.gpa.free(full);
 
-        const resp = self.executor.execute(
+        // 走 header-capable 执行器(真实 http 会发送 req_headers 并回传响应头);
+        // 未实现的 mock 由 executeWithHeaders 回退到 execute,行为不变。
+        const resp = self.executor.executeWithHeaders(
             self.gpa,
             io,
             if (body != null) .post else .get,
             full,
+            req_headers,
             body,
         );
         switch (resp) {
             .err => |e| return .{ .err = e }, // 传输错误:交给 execute 的 -1 退避
-            .ok => |b| {
+            .ok => |r| {
+                const b = r.takeBody(self.gpa); // 释放响应头、取回 gpa 拥有的 body
                 var we = WxError.fromJson(self.gpa, b, self.wx_type) catch {
                     // 非 JSON 响应(如 "ok")按成功透传,对应 Java 的宽容解析
                     return .{ .ok = b };
@@ -319,7 +347,7 @@ pub const Service = struct {
                     _ = self.config.expireAccessToken(io, tok);
                     we.deinit();
                     self.gpa.free(b);
-                    return self.executeInternal(io, uri, body, true);
+                    return self.executeInternal(io, uri, body, true, req_headers);
                 }
                 self.gpa.free(b); // WxError.raw 已持有副本
                 return .{ .err = we };
@@ -701,4 +729,21 @@ test "createJsapiSignature: SHA1.genWithAmple over ticket/noncestr/timestamp/url
     }
     // 签名只取 ticket(走缓存),不触发网络请求
     try testing.expectEqual(@as(usize, 0), rec.calls);
+}
+
+test "Service.initWithRealHttp: mp call wired to real std.http executor" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try mkCfg(gpa, false);
+    defer cfg.deinit();
+    var http = http_mod.HttpExecutor.init(gpa, io);
+    const svc = Service.initWithRealHttp(gpa, cfg.config(), &http);
+
+    // 注入的是真实执行器(回传响应头 + 接受请求头),而非只有 mock 可用;
+    // 不发起真实网络请求(离线),仅验证构造路径已接通。
+    try testing.expect(svc.executor.vtable.execute_ex != null);
+    try testing.expect(svc.executor.vtable.execute_with_headers != null);
 }
