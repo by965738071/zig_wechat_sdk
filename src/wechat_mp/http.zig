@@ -7,15 +7,16 @@
 //! 返回响应 body 的 gpa 分配副本。
 //! 媒体上传(multipart)等特化 executor 以同构 vtable 补充即可(TODO)。
 const std = @import("std");
-const token_mod = @import("common").token;
-const error_mod = @import("common").error_util;
-const result_mod = @import("common").result;
-const json_util = @import("common").json_util;
-const config_mod = @import("config.zig");
 
+const error_mod = @import("common").error_util;
 pub const WxError = error_mod.WxError;
+const json_util = @import("common").json_util;
+const result_mod = @import("common").result;
 pub const WxResult = result_mod.WxResult;
 pub const Response = result_mod.Response;
+const token_mod = @import("common").token;
+
+const config_mod = @import("config.zig");
 
 /// 请求执行器(对应 `RequestExecutor<T, E>` + `RequestHttp` 的组合角色)。
 ///
@@ -169,19 +170,125 @@ pub fn httpRequest(
     return .{ .status = status, .body = owned, .headers = headers };
 }
 
+// ---------------------------------------------------------------------------
+// 真实请求的墙钟超时(dev.954 的 std.http.Client 无 per-request 超时入口)。
+//
+// 工具链重核:RequestOptions / FetchOptions / Client 均无 connect/read 超时字段;
+// 全 std/http/Client.zig 唯一的 Io.Timeout —— ConnectTcpOptions.timeout —— 是
+// 「声明但未接线」的死字段(connectTcpOptions 函数体从不读取它)。因此不经由
+// 改写标准库,而用 std.Io 的并发 + 取消机制对整条请求施加 deadline。
+// ---------------------------------------------------------------------------
+
+/// 被竞速的请求任务写回的结果槽:仅由任务写、父任务在 cancelDiscard(等待任务
+/// 结束)之后读,Select 队列 / Group 提供 happens-before,无数据竞争。
+const RequestOutcome = struct {
+    raw: ?RawHttpResponse = null,
+    err: ?anyerror = null,
+};
+
+/// Select 的两个结果标签(负载 void;真正的响应放在共享 RequestOutcome)。
+const DeadlineOutcome = union(enum) {
+    request: void,
+    timer: void,
+};
+
+/// 请求任务:执行原始 httpRequest(6 参数,签名不变),结果写回共享槽。
+fn requestTask(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    method: RequestExecutor.Method,
+    uri: []const u8,
+    extra: []const std.http.Header,
+    body: ?[]const u8,
+    out: *RequestOutcome,
+) void {
+    if (httpRequest(gpa, io, method, uri, extra, body)) |raw| {
+        out.raw = raw;
+    } else |e| {
+        out.err = e;
+    }
+}
+
+/// 计时任务:睡到 deadline(可取消),到点即代表超时。
+fn timerTask(io: std.Io, timeout: std.Io.Timeout) void {
+    timeout.sleep(io) catch {};
+}
+
+/// 带超时的真实请求 —— 把整条请求与一个计时器用 `std.Io.Select` 竞速:
+///  - 请求先完成 -> 取消计时器,返回响应;
+///  - 计时器先到 -> cancelDiscard 取消请求任务(其 socket connect/read 都是
+///    `Io.Cancelable` 取消点,Threaded 后端以 signalCanceledSyscall 打断阻塞
+///    的系统调用),返回 error.RequestTimeout。
+/// 这是对 connect + read 的**整个请求**施加一个墙钟上限(=
+/// connect_timeout_ms + read_timeout_ms),是当前 stdlib 能提供的最接近正确的
+/// 行为;不谎称存在 per-request 的独立 connect/read 超时。
+/// 若 Io 不支持并发(ConcurrencyUnavailable),退化为不带超时的同步请求(诚实降级)。
+/// 所有权:`.ok` 为 RawHttpResponse(body/headers 由 gpa 拥有,用毕 deinit)。
+pub fn httpRequestWithTimeout(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    method: RequestExecutor.Method,
+    uri: []const u8,
+    extra: []const std.http.Header,
+    body: ?[]const u8,
+    timeout: std.Io.Timeout,
+) !RawHttpResponse {
+    if (timeout == .none) return httpRequest(gpa, io, method, uri, extra, body);
+
+    var shared: RequestOutcome = .{};
+    var buffer: [2]DeadlineOutcome = undefined;
+    var sel = std.Io.Select(DeadlineOutcome).init(io, &buffer);
+
+    // 先起计时器;并发不可用时退化为同步请求(不带超时)。
+    sel.concurrent(.timer, timerTask, .{ io, timeout }) catch {
+        return httpRequest(gpa, io, method, uri, extra, body);
+    };
+    sel.concurrent(.request, requestTask, .{ gpa, io, method, uri, extra, body, &shared }) catch {
+        sel.cancelDiscard();
+        return httpRequest(gpa, io, method, uri, extra, body);
+    };
+
+    const first = sel.await() catch |e| {
+        sel.cancelDiscard();
+        return e;
+    };
+    // 等待其余任务结束(取消计时器 / 打断请求),确保 shared 写入对父任务可见。
+    sel.cancelDiscard();
+    switch (first) {
+        .timer => {
+            // 竞速窗口内请求恰好成功:丢弃该响应,仍按超时处理(避免泄漏)。
+            if (shared.raw) |raw| raw.deinit(gpa);
+            return error.RequestTimeout;
+        },
+        .request => {
+            if (shared.raw) |raw| return raw;
+            if (shared.err) |e| return e;
+            return error.RequestTimeout;
+        },
+    }
+}
+
 pub const HttpExecutor = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// 对应 Java `WxPayConfig.httpConnectionTimeout / httpTimeout`。
-    /// **仍仅记录、暂未生效**(本轮按 dev.954 重核,如实保留、不伪造实现):
-    ///  - `fetch`/`FetchOptions`/`RequestOptions` 均无 timeout 字段;
-    ///  - 全 `std/http/Client.zig` 唯一的 `Io.Timeout` 是 `ConnectTcpOptions.timeout`
-    ///    (`Client.zig:1449`),但 `connectTcpOptions`(1452-1490)函数体从未读取它,
-    ///    是「声明但未接线」的死字段;`request()` 走 `connect()` 也不带 Options。
-    /// 结论:标准库高层 API(fetch/request)仍无可用 connect/read 超时入口,
-    /// 不擅自绕过/改写标准库,字段仅作配置占位,不宣称已生效。
+    /// 对应 Java `WxPayConfig.httpConnectionTimeout / httpTimeout`(单位毫秒)。
+    /// dev.954 重核:`RequestOptions` / `FetchOptions` / `Client` 均无 connect/read
+    /// 超时字段;唯一的 `ConnectTcpOptions.timeout` 是死字段(connectTcpOptions
+    /// 从不读取)。**本轮已让字段生效**:二者由 `requestDeadline()` 折成整请求的
+    /// 墙钟上限,经 `httpRequestWithTimeout` 用 std.Io 取消机制施加 —— 超时触发
+    /// 即取消在途请求(connect/read 取消点),不会无限等待。二者皆 0 时禁用超时。
+    /// 详见 `httpRequestWithTimeout` 注释(不改写标准库、不伪造 per-request 入口)。
     connect_timeout_ms: u64 = 3_000,
     read_timeout_ms: u64 = 30_000,
+
+    /// 把 connect/read 超时折算成整请求的 `std.Io.Timeout`(dev.954 stdlib 无
+    /// per-request connect/read 超时入口,见 httpRequestWithTimeout 注释)。
+    /// 两个字段都为 0 表示禁用(.none)。
+    pub fn requestDeadline(self: *const HttpExecutor) std.Io.Timeout {
+        const total_ms = self.connect_timeout_ms + self.read_timeout_ms;
+        if (total_ms == 0) return .none;
+        return .{ .duration = .{ .raw = .fromMilliseconds(@intCast(total_ms)), .clock = .real } };
+    }
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) HttpExecutor {
         return .{ .gpa = gpa, .io = io };
@@ -207,8 +314,8 @@ pub const HttpExecutor = struct {
 
     /// 真实执行:回传 `Response{body,headers}`(响应头由 httpRequest 抓取)。
     fn executeExImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: RequestExecutor.Method, uri: []const u8, body: ?[]const u8) WxResult(Response) {
-        _ = ctx;
-        const raw = httpRequest(gpa, io, method, uri, &.{}, body) catch |e|
+        const self: *HttpExecutor = @ptrCast(@alignCast(ctx));
+        const raw = httpRequestWithTimeout(gpa, io, method, uri, &.{}, body, self.requestDeadline()) catch |e|
             return .{ .err = WxError.transport(gpa, "http {s} {s}: {s}", .{ @tagName(method), uri, @errorName(e) }) };
         return foldAndWrap(gpa, uri, raw);
     }
@@ -216,14 +323,14 @@ pub const HttpExecutor = struct {
     /// 带自定义请求头的真实执行:把 `result.Header` 转成 `std.http.Header` 交给
     /// `extra_headers`,同时回传响应头(multipart `Content-Type` 用)。
     fn executeWithHeadersImpl(ctx: *anyopaque, gpa: std.mem.Allocator, io: std.Io, method: RequestExecutor.Method, uri: []const u8, req_headers: []const RequestExecutor.Header, body: ?[]const u8) WxResult(Response) {
-        _ = ctx;
+        const self: *HttpExecutor = @ptrCast(@alignCast(ctx));
         var extra = std.ArrayList(std.http.Header).empty;
         defer extra.deinit(gpa);
         for (req_headers) |h| {
             extra.append(gpa, .{ .name = h.name, .value = h.value }) catch
                 return .{ .err = WxError.transport(gpa, "oom", .{}) };
         }
-        const raw = httpRequest(gpa, io, method, uri, extra.items, body) catch |e|
+        const raw = httpRequestWithTimeout(gpa, io, method, uri, extra.items, body, self.requestDeadline()) catch |e|
             return .{ .err = WxError.transport(gpa, "http {s} {s}: {s}", .{ @tagName(method), uri, @errorName(e) }) };
         return foldAndWrap(gpa, uri, raw);
     }
@@ -723,4 +830,64 @@ test "stable access token posts Java WxMpStableAccessTokenRequest payload" {
     try std.testing.expect(std.mem.indexOf(u8, exec.last_body, "\"appid\":\"wxAPPID\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, exec.last_body, "\"secret\":\"SECRET\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, exec.last_body, "\"force_refresh\":false") != null);
+}
+
+// ---------------------------------------------------------------------------
+// 超时接线单测(离线)
+// ---------------------------------------------------------------------------
+
+test "HttpExecutor.requestDeadline: connect/read ms 折成 std.Io.Timeout,0 时禁用" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var http = HttpExecutor.init(gpa, io);
+    http.connect_timeout_ms = 1000;
+    http.read_timeout_ms = 2000;
+    switch (http.requestDeadline()) {
+        .duration => |d| try std.testing.expectEqual(@as(i64, 3000), d.raw.toMilliseconds()),
+        else => return error.UnexpectedDeadlineTag,
+    }
+    // 两个字段都置 0 -> 禁用(.none),请求不再被超时竞速包裹。
+    http.connect_timeout_ms = 0;
+    http.read_timeout_ms = 0;
+    switch (http.requestDeadline()) {
+        .none => {},
+        else => return error.UnexpectedDeadlineTag,
+    }
+}
+
+test "超时竞速:deadline 触发即取消在途任务(httpRequestWithTimeout 的机制)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 复用生产代码的 DeadlineOutcome 标签 + timerTask,验证
+    // httpRequestWithTimeout 依赖的「deadline 到点 -> cancelDiscard 打断在途任务」
+    // 在本 Zig 版本真实生效(离线、无需真实网络端点 —— 真实 connect/read 超时
+    // 需要活动端点,此处只测其竞速/取消原语)。
+    const Shared = struct { finished: bool = false };
+    const Slow = struct {
+        fn run(io2: std.Io, s: *Shared) void {
+            std.Io.sleep(io2, .fromMilliseconds(2000), .real) catch return;
+            s.finished = true;
+        }
+    };
+    const short: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .real } };
+
+    var shared = Shared{};
+    var buffer: [2]DeadlineOutcome = undefined;
+    var sel = std.Io.Select(DeadlineOutcome).init(io, &buffer);
+    try sel.concurrent(.request, Slow.run, .{ io, &shared });
+    try sel.concurrent(.timer, timerTask, .{ io, short });
+    const first = try sel.await();
+    sel.cancelDiscard(); // 取消在途的慢任务(取消点返回 error.Canceled)
+    switch (first) {
+        .timer => {},
+        .request => return error.ExpectedTimeout,
+    }
+    // 慢任务确实被取消、未跑完 -> 证明超时能打断在途请求,而非空等。
+    try std.testing.expect(!shared.finished);
 }

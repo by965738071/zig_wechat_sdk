@@ -8,11 +8,12 @@
 //!
 //! 这是骨架中**完整实现**的公共方法之一（加解密是所有后端都复用的底座）。
 const std = @import("std");
+
+const random = @import("../random.zig");
+const xml = @import("../xml.zig");
 const aes_mode = @import("aes_mode.zig");
 const pkcs7 = @import("pkcs7.zig");
 const sha1 = @import("sha1.zig");
-const random = @import("../random.zig");
-const xml = @import("../xml.zig");
 
 pub const Error = error{
     InvalidAesKey, // EncodingAESKey 非法（长度/解码失败）
@@ -199,20 +200,21 @@ const k_aes_key = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFE";
 const k_token = "pamtest";
 const k_appid = "wxb11529c136998cb6";
 
-fn crypt(comptime appid: []const u8) !struct { c: WxCrypt, t: std.Io.Threaded } {
-    var t = std.Io.Threaded.init(std.testing.allocator, .{});
-    errdefer t.deinit();
-    const c = try WxCrypt.init(std.testing.allocator, t.io(), k_token, k_aes_key, appid);
-    return .{ .c = c, .t = t };
+// `std.Io` 持有指向 `Threaded` 的指针(`io.userdata = t`),故 Threaded 必须在
+// 调用方栈帧上保持地址稳定,不能按值返回(否则 c.io 成为悬垂指针,首次用到 io
+// 的 encryptMessage 会在损坏的 mutex 上死锁)。由测试持有并传入指针。
+fn crypt(t: *std.Io.Threaded, comptime appid: []const u8) !WxCrypt {
+    return WxCrypt.init(std.testing.allocator, t.io(), k_token, k_aes_key, appid);
 }
 
 test "wx_crypt aes vector matches java testAesEncrypt" {
     const gpa = std.testing.allocator;
-    var wrapped = try crypt(k_appid);
-    defer wrapped.t.deinit();
-    defer wrapped.c.deinit();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wrapped = try crypt(&threaded, k_appid);
+    defer wrapped.deinit();
 
-    const got = try wrapped.c.encrypt("aaaabbbbccccdddd", "我是中文abcd123");
+    const got = try wrapped.encrypt("aaaabbbbccccdddd", "我是中文abcd123");
     defer gpa.free(got);
     try std.testing.expectEqualStrings(
         "jn1L23DB+6ELqJ+6bruv21Y6MD7KeIfP82D6gU39rmkgczbWwt5+3bnyg5K55bgVtVzd832WzZGMhkP72vVOfg==",
@@ -222,12 +224,13 @@ test "wx_crypt aes vector matches java testAesEncrypt" {
 
 test "wx_crypt aes vector 2 (xml reply)" {
     const gpa = std.testing.allocator;
-    var wrapped = try crypt(k_appid);
-    defer wrapped.t.deinit();
-    defer wrapped.c.deinit();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wrapped = try crypt(&threaded, k_appid);
+    defer wrapped.deinit();
 
     const reply2 = "<xml><ToUserName><![CDATA[oia2Tj我是中文jewbmiOUlr6X-1crbLOvLw]]></ToUserName><FromUserName><![CDATA[gh_7f083739789a]]></FromUserName><CreateTime>1407743423</CreateTime><MsgType><![CDATA[video]]></MsgType><Video><MediaId><![CDATA[eYJ1MbwPRJtOvIEabaxHs7TX2D-HV71s79GUxqdUkjm6Gs2Ed1KF3ulAOA9H1xG0]]></MediaId><Title><![CDATA[testCallBackReplyVideo]]></Title><Description><![CDATA[testCallBackReplyVideo]]></Description></Video></xml>";
-    const got = try wrapped.c.encrypt("aaaabbbbccccdddd", reply2);
+    const got = try wrapped.encrypt("aaaabbbbccccdddd", reply2);
     defer gpa.free(got);
     try std.testing.expectEqualStrings(
         "jn1L23DB+6ELqJ+6bruv23M2GmYfkv0xBh2h+XTBOKVKcgDFHle6gqcZ1cZrk3e1qjPQ1F4RsLWzQRG9udbKWesxlkupqcEcW7ZQweImX9+wLMa0GaUzpkycA8+IamDBxn5loLgZpnS7fVAbExOkK5DYHBmv5tptA9tklE/fTIILHR8HLXa5nQvFb3tYPKAlHF3rtTeayNf0QuM+UW/wM9enGIDIJHF7CLHiDNAYxr+r+OrJCmPQyTy8cVWlu9iSvOHPT/77bZqJucQHQ04sq7KZI27OcqpQNSto2OdHCoTccjggX5Z9Mma0nMJBU+jLKJ38YB1fBIz+vBzsYjrTmFQ44YfeEuZ+xRTQwr92vhA9OxchWVINGC50qE/6lmkwWTwGX9wtQpsJKhP+oS7rvTY8+VdzETdfakjkwQ5/Xka042OlUb1/slTwo4RscuQ+RdxSGvDahxAJ6+EAjLt9d8igHngxIbf6YyqqROxuxqIeIch3CssH/LqRs+iAcILvApYZckqmA7FNERspKA5f8GoJ9sv8xmGvZ9Yrf57cExWtnX8aCMMaBropU/1k+hKP5LVdzbWCG0hGwx/dQudYR/eXp3P0XxjlFiy+9DMlaFExWUZQDajPkdPrEeOwofJb",
@@ -237,12 +240,13 @@ test "wx_crypt aes vector 2 (xml reply)" {
 
 test "wx_crypt roundtrip: encryptMessage → toXml → decryptXml" {
     const gpa = std.testing.allocator;
-    var wrapped = try crypt(k_appid);
-    defer wrapped.t.deinit();
-    defer wrapped.c.deinit();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wrapped = try crypt(&threaded, k_appid);
+    defer wrapped.deinit();
 
     const reply = "我是中文abcd123";
-    var ctx = try wrapped.c.encryptMessage(reply);
+    var ctx = try wrapped.encryptMessage(reply);
     defer ctx.deinit(gpa);
 
     // 出站 xml 可被再次解析（结构完整性）
@@ -258,42 +262,45 @@ test "wx_crypt roundtrip: encryptMessage → toXml → decryptXml" {
     );
     defer gpa.free(msg_xml);
 
-    const plain = try wrapped.c.decryptXml(ctx.msg_signature, ctx.timestamp, ctx.nonce, msg_xml);
+    const plain = try wrapped.decryptXml(ctx.msg_signature, ctx.timestamp, ctx.nonce, msg_xml);
     defer gpa.free(plain);
     try std.testing.expectEqualStrings(reply, plain);
 }
 
 test "wx_crypt wrong signature and wrong appid" {
     const gpa = std.testing.allocator;
-    var wrapped = try crypt(k_appid);
-    defer wrapped.t.deinit();
-    defer wrapped.c.deinit();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wrapped = try crypt(&threaded, k_appid);
+    defer wrapped.deinit();
 
-    const cipher = try wrapped.c.encrypt("aaaabbbbccccdddd", "hello");
+    const cipher = try wrapped.encrypt("aaaabbbbccccdddd", "hello");
     defer gpa.free(cipher);
 
     const sig = try sha1.gen(gpa, &.{ k_token, "1409304348", "xxxxxx", cipher });
     defer gpa.free(sig);
 
     // 错误签名 → SignatureMismatch
-    try std.testing.expectError(error.SignatureMismatch, wrapped.c.decryptContent("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "1409304348", "xxxxxx", cipher));
+    try std.testing.expectError(error.SignatureMismatch, wrapped.decryptContent("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "1409304348", "xxxxxx", cipher));
 
     // 相同密文、不同 appid → AppidMismatch（对齐 Java 校验 appid 归属）
-    var other = try crypt("wxb11529c136998cb7");
-    defer other.t.deinit();
-    defer other.c.deinit();
-    try std.testing.expectError(error.AppidMismatch, other.c.decryptContent(sig, "1409304348", "xxxxxx", cipher));
+    var other_threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer other_threaded.deinit();
+    var other = try crypt(&other_threaded, "wxb11529c136998cb7");
+    defer other.deinit();
+    try std.testing.expectError(error.AppidMismatch, other.decryptContent(sig, "1409304348", "xxxxxx", cipher));
 }
 
 test "wx_crypt decrypt without signature" {
     const gpa = std.testing.allocator;
-    var wrapped = try crypt(k_appid);
-    defer wrapped.t.deinit();
-    defer wrapped.c.deinit();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var wrapped = try crypt(&threaded, k_appid);
+    defer wrapped.deinit();
 
-    const cipher = try wrapped.c.encrypt("aaaabbbbccccdddd", "plain-text-中文");
+    const cipher = try wrapped.encrypt("aaaabbbbccccdddd", "plain-text-中文");
     defer gpa.free(cipher);
-    const plain = try wrapped.c.decrypt(cipher);
+    const plain = try wrapped.decrypt(cipher);
     defer gpa.free(plain);
     try std.testing.expectEqualStrings("plain-text-中文", plain);
 }

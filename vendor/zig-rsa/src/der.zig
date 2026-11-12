@@ -273,7 +273,7 @@ test "parser.expectInt" {
     try std.testing.expectEqual(@as(u8, 1), try parser.expectInt(u8));
 }
 
-pub const Identifier = packed struct(u8) {
+pub const Identifier = bitpack struct(u8) {
     tag: Tag,
     constructed: bool,
     class: Class,

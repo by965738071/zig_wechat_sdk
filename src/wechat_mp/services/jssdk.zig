@@ -6,22 +6,33 @@
 //! `/cgi-bin/ticket/getticket?type=<TicketType.code>`（JSAPI 的 code 为 `"jsapi"`，
 //! 以 Java 源码为准，并非任务描述里的 `/cgi-bin/ticket/get`）。
 //!
-//! 与 Java 的差异（骨架阶段）：
-//! - Java 把 ticket 缓存在 ConfigStorage（`updateTicket/isTicketExpired` + 锁），
-//!   Zig 骨架未实现 ticket 缓存，`getTicket` 每次直接发 GET（缺口见文件尾）；
-//! - Java `createJsapiSignature` 内部用 `RandomUtils.getRandomStr()`（16 位
-//!   `[a-zA-Z0-9]`）+ `System.currentTimeMillis()/1000`；Zig 拆成两层：
-//!   `createSignature` 允许注入 nonce/timestamp（测试确定性），
-//!   `create` 才自动生成（对应 Java 原始签名形态）。
+//! 签名路径统一（修复此前的双重实现）：`create` / `createSignature` 一律委托
+//! `Service.createJsapiSignature` —— 后者经 `ConfigStorage.acquireJsapiTicket`
+//! 取**带缓存**的 jsapi ticket（过期 / force 刷新 / 锁协议在 common/token）。
+//! 这样签名不再绕过 ticket 缓存，全仓只有 Service 一处产生 JS-SDK 签名
+//! （SHA1 单一来源），不会因直连 getticket 而旁路缓存。
+//! 本文件的 `getTicket` / `getJsapiTicket` 保留为**底层、不带缓存**的裸拉取
+//! 原语（直接 GET getticket），仅供需要读取「当前 ticket」的场景 / 既有测试；
+//! 需要签名时一律走 `create` / `createSignature`。`signJsapi` 保留为纯 SHA1
+//! helper（离线可测的已知向量）。
+//!
+//! Java `createJsapiSignature` 内部用 `RandomUtils.getRandomStr()`（16 位
+//! `[a-zA-Z0-9]`）+ `System.currentTimeMillis()/1000`；这里 `createSignature`
+//! 允许注入 nonce/timestamp（测试确定性），`create` 用 inject=null 让 Service
+//! 自动生成（对应 Java 原始签名形态）。
 const std = @import("std");
-const json_util = @import("common").json_util;
-const result_mod = @import("common").result;
-const error_mod = @import("common").error_util;
-const sha1_mod = @import("common").crypt.sha1;
-const random_mod = @import("common").random;
-const service_mod = @import("../service.zig");
 
+const error_mod = @import("common").error_util;
+const json_util = @import("common").json_util;
+const random_mod = @import("common").random;
+const result_mod = @import("common").result;
 pub const WxResult = result_mod.WxResult;
+const sha1_mod = @import("common").crypt.sha1;
+const token_mod = @import("common").token;
+
+const config_mod = @import("../config.zig");
+const http_mod = @import("../http.zig");
+const service_mod = @import("../service.zig");
 
 /// 对应 Java `enums/TicketType`（code 与 Java 逐一对齐）。
 pub const TicketType = enum {
@@ -148,10 +159,11 @@ pub const JssdkService = struct {
         return self.getTicket(io, .jsapi);
     }
 
-    /// 对应 `createJsapiSignature(String url)`，但 nonce/timestamp 由调用方注入
-    /// （Java 内部随机生成；注入是为了测试可断言已知向量）。
-    /// 流程与 Java 相同：getJsapiTicket(false) → SHA1.genWithAmple → 组装
-    /// `WxJsapiSignature`（appId 取 config.getAppId()）。
+    /// 对应 `createJsapiSignature(String url)`，nonce/timestamp 由调用方注入
+    /// （注入是为了测试可断言已知向量）。
+    /// **单一来源**：委托 `Service.createJsapiSignature`，后者经带缓存的
+    /// `ConfigStorage.acquireJsapiTicket` 取 ticket，不再绕过缓存、也不再自行
+    /// 计算签名（此前本文件曾有一套独立的直连 + SHA1 实现）。
     pub fn createSignature(
         self: *JssdkService,
         io: std.Io,
@@ -159,51 +171,40 @@ pub const JssdkService = struct {
         nonce_str: []const u8,
         timestamp: i64,
     ) WxResult(JsSignature) {
-        const gpa = self.svc.gpa;
-        var tk = switch (self.getJsapiTicket(io)) {
-            .ok => |t| t,
-            .err => |e| return .{ .err = e },
-        };
-        defer tk.deinit();
-
-        const sig = switch (signJsapi(gpa, tk.ticket, nonce_str, timestamp, url)) {
-            .ok => |s| s,
-            .err => |e| return .{ .err = e },
-        };
-        errdefer gpa.free(sig);
-
-        const app_id = gpa.dupe(u8, self.svc.config.appid()) catch {
-            gpa.free(sig);
-            return .{ .err = error_mod.WxError.internal(gpa, "oom", .{}) };
-        };
-        errdefer gpa.free(app_id);
-        const nonce = gpa.dupe(u8, nonce_str) catch {
-            gpa.free(app_id);
-            gpa.free(sig);
-            return .{ .err = error_mod.WxError.internal(gpa, "oom", .{}) };
-        };
-        return .{ .ok = .{
-            .gpa = gpa,
-            .app_id = app_id,
-            .nonce_str = nonce,
+        return switch (self.svc.createJsapiSignature(io, url, .{
+            .noncestr = nonce_str,
             .timestamp = timestamp,
-            .signature = sig,
-        } };
+        })) {
+            .ok => |s| .{ .ok = self.wrapSignature(s) },
+            .err => |e| .{ .err = e },
+        };
     }
 
-    /// 对应 Java `createJsapiSignature(url)` 原始形态：
-    /// nonce = `RandomUtils.getRandomStr()`（16 位字母数字，见 common/random.zig），
-    /// timestamp = `System.currentTimeMillis() / 1000`（墙钟秒）。
+    /// 对应 Java `createJsapiSignature(url)` 原始形态（随机 nonce + 墙钟秒）。
+    /// 同样委托缓存版 Service 路径；`inject=null` 时由 Service 自动生成 16 位
+    /// nonce 与秒级时间戳（对应 Java RandomUtils / currentTimeMillis）。
     pub fn create(self: *JssdkService, io: std.Io, url: []const u8) WxResult(JsSignature) {
-        var nonce: [16]u8 = undefined;
-        random_mod.randomStr(io, &nonce) catch |e| return .{
-            .err = error_mod.WxError.transport(self.svc.gpa, "随机串生成失败: {s}", .{@errorName(e)}),
+        return switch (self.svc.createJsapiSignature(io, url, null)) {
+            .ok => |s| .{ .ok = self.wrapSignature(s) },
+            .err => |e| .{ .err = e },
         };
-        const ts: i64 = @intCast(@divFloor(
-            std.Io.Timestamp.now(io, .real).nanoseconds,
-            std.time.ns_per_s,
-        ));
-        return self.createSignature(io, url, &nonce, ts);
+    }
+
+    /// 把 `Service.JsapiSignature` 转成本文件的 `JsSignature`：不重复计算、
+    /// 不重复分配。Service 侧 4 个字段（appid/noncestr/url/signature）全为 gpa
+    /// 拥有；`JsSignature` 不含 url（调用方本就持有 url），故此处 free 掉 url，
+    /// 其余 3 个串**转移所有权**给返回值，且不调用 Service 侧的 deinit
+    /// （避免 double free）。
+    fn wrapSignature(self: *JssdkService, s: service_mod.Service.JsapiSignature) JsSignature {
+        const sig = s;
+        self.svc.gpa.free(sig.url);
+        return .{
+            .gpa = self.svc.gpa,
+            .app_id = sig.appid,
+            .nonce_str = sig.noncestr,
+            .timestamp = sig.timestamp,
+            .signature = sig.signature,
+        };
     }
 };
 
@@ -254,9 +255,24 @@ const TestCtx = struct {
         }
     };
 
+    /// 签名委托给 Service 后,ticket 改由带缓存的 ticket_fetcher 提供,
+    /// 不再是 MockExec 直连 getticket。
+    const TicketFetch = struct {
+        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) token_mod.FetchOutcome {
+            _ = c;
+            _ = i;
+            const t = g.dupe(u8, doc_ticket) catch return .{ .err = error_mod.WxError.transport(g, "oom", .{}) };
+            return .{ .ok = .{ .token = t, .expires_in = 7200 } };
+        }
+    };
+
     fn init(gpa: std.mem.Allocator) !TestCtx {
         const threaded = std.Io.Threaded.init(gpa, .{});
-        const cfg = try config_mod.InMemoryConfigStorage.init(gpa, .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } }, .{ .appid = "A", .secret = "S" });
+        const cfg = try config_mod.InMemoryConfigStorage.init(gpa, .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } }, .{
+            .appid = "A",
+            .secret = "S",
+            .ticket_fetcher = .{ .ptr = undefined, .vtable = &.{ .fetch = TicketFetch.f } },
+        });
         return .{ .threaded = threaded, .cfg = cfg };
     }
 
@@ -273,10 +289,6 @@ const TestCtx = struct {
         return service_mod.Service.init(self.cfg.gpa, self.cfg.config(), exec);
     }
 };
-
-const http_mod = @import("../http.zig");
-const token_mod = @import("common").token;
-const config_mod = @import("../config.zig");
 
 /// 官方文档示例向量（与 Java `SHA1.genWithAmple` 结果一致，期望值预先用
 /// python hashlib 算好写死）。
@@ -380,9 +392,9 @@ test "jssdk createSignature full flow (injected nonce/ts)" {
             return error.Unexpected;
         },
     }
-    // 恰好一次 ticket 请求（token 走缓存）
-    try std.testing.expectEqual(@as(usize, 1), mock.calls);
-    try std.testing.expect(std.mem.indexOf(u8, mock.last_uri, "type=jsapi") != null);
+    // 签名委托给带缓存的 Service 路径:ticket 来自 ticket_fetcher,
+    // 不再经由 MockExec 直连 getticket(缓存/刷新不被旁路)。
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
 }
 
 test "jssdk create generates nonce and timestamp" {
@@ -440,4 +452,65 @@ test "jssdk getticket errcode folds to WxError" {
         },
     }
     try std.testing.expectEqual(@as(usize, 1), mock.calls);
+}
+
+test "jssdk 签名委托缓存:ticket_fetcher 只拉取一次且无直连 getticket" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 计数型 ticket_fetcher:证明缓存命中(第二次签名不再拉取)。
+    const Counting = struct {
+        count: usize = 0,
+        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) token_mod.FetchOutcome {
+            _ = i;
+            const self: *@This() = @ptrCast(@alignCast(c));
+            self.count += 1;
+            const t = g.dupe(u8, doc_ticket) catch return .{ .err = error_mod.WxError.transport(g, "oom", .{}) };
+            return .{ .ok = .{ .token = t, .expires_in = 7200 } };
+        }
+        fn fetcher(self: *@This()) token_mod.Fetcher {
+            return .{ .ptr = @ptrCast(self), .vtable = &.{ .fetch = f } };
+        }
+    };
+    var counting = Counting{};
+    const AF = struct {
+        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) token_mod.FetchOutcome {
+            _ = c;
+            _ = i;
+            const t = g.dupe(u8, "TOK") catch return .{ .err = error_mod.WxError.transport(g, "oom", .{}) };
+            return .{ .ok = .{ .token = t, .expires_in = 7200 } };
+        }
+    };
+    var cfg = try config_mod.InMemoryConfigStorage.init(gpa, .{ .ptr = undefined, .vtable = &.{ .fetch = AF.f } }, .{
+        .appid = "A",
+        .secret = "S",
+        .ticket_fetcher = counting.fetcher(),
+    });
+    defer cfg.deinit();
+
+    // MockExec 若被调用就说明又绕回了直连 getticket(缓存被旁路)。
+    var mock = MockExec{ .gpa = gpa, .resp = "{}" };
+    defer mock.deinit();
+    var svc = service_mod.Service.init(gpa, cfg.config(), mock.executor());
+    var jssdk = JssdkService{ .svc = &svc };
+
+    for (0..2) |_| {
+        switch (jssdk.createSignature(io, doc_url, doc_nonce, doc_ts)) {
+            .ok => |s| {
+                var sig = s;
+                defer sig.deinit();
+                try std.testing.expectEqualStrings(doc_sig, sig.signature);
+            },
+            .err => |e| {
+                var err = e;
+                defer err.deinit();
+                return error.Unexpected;
+            },
+        }
+    }
+    // ticket 只拉取一次(命中缓存),且完全没有直连 getticket 请求。
+    try std.testing.expectEqual(@as(usize, 1), counting.count);
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
 }

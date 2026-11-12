@@ -8,8 +8,9 @@
 //!
 //! 工具链核对(Zig 0.18.0-dev.954+60635c2bd):旧版 `std.process.getEnvVarOwned`
 //! 已移除,`std.fs.Dir.readFileAlloc` 迁到 `std.Io.Dir.readFileAlloc`;环境变量
-//! 改由 `std.process.Environ` 提供(生产 = 调用方 `Io.Threaded.environ`,
-//! 离线测试 = `Environ.Map.createPosixBlock` 构造,不依赖真实进程环境)。
+//! 注入统一走平台无关的 `std.process.Environ.Map`(已解析的 KV 快照):生产由
+//! 调用方 `Environ.createMap(process_environ, gpa)` 构造,离线测试由
+//! `Map.init`/`put` 直接构造,不依赖真实进程环境。
 const std = @import("std");
 
 /// 凭证来源。各变体携带的是「来源标识」(路径/变量名/文本),本身不是秘密,
@@ -19,9 +20,10 @@ pub const Source = union(enum) {
     text: []const u8,
     /// 文件路径:走 `std.Io.Dir.cwd().readFileAlloc` 读取。
     file: []const u8,
-    /// 环境变量名:由 `environ` 查表。生产 environ 由调用方注入
-    /// (`Io.Threaded.environ`),离线测试由 `Environ.Map.createPosixBlock` 构造。
-    env: struct { name: []const u8, environ: std.process.Environ },
+    /// 环境变量名:由自带的 `Environ.Map` 快照查表(平台无关)。生产 map 由调用方
+    /// `Environ.createMap(process_environ, gpa)` 构造;离线测试由 `Map.init`/`put`
+    /// 直接构造,不碰进程全局状态。
+    env: struct { name: []const u8, map: *const std.process.Environ.Map },
 
     /// 供错误信息使用的来源标识(绝不含材料本身)。
     pub fn label(self: Source) []const u8 {
@@ -37,12 +39,15 @@ pub const Source = union(enum) {
 pub const max_credential_bytes: usize = 64 * 1024;
 
 /// 从来源读出凭证字节(gpa 拥有,调用方 free)。
-/// `io` 供文件读取;`env` 变体用自带 `environ`,不碰进程全局状态。
+/// `io` 供文件读取;`env` 变体用自带 `map` 快照查表,不碰进程全局状态。
 pub fn read(gpa: std.mem.Allocator, io: std.Io, src: Source) ![]u8 {
     return switch (src) {
         .text => |t| try gpa.dupe(u8, t),
         .file => |path| try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_credential_bytes)),
-        .env => |e| try e.environ.getAlloc(gpa, e.name),
+        .env => |e| blk: {
+            const value = e.map.get(e.name) orelse return error.EnvironmentVariableMissing;
+            break :blk try gpa.dupe(u8, value);
+        },
     };
 }
 
@@ -71,27 +76,25 @@ test "read(text) returns owned dupe" {
     try std.testing.expect(got.ptr != TEST_PEM_TEXT.ptr);
 }
 
-test "read(env) from constructed Environ; missing -> EnvironmentVariableMissing" {
+test "read(env) from constructed Environ.Map; missing -> EnvironmentVariableMissing" {
     const gpa = std.testing.allocator;
     var map = std.process.Environ.Map.init(gpa);
     defer map.deinit();
     try map.put("WX_TEST_PRIV_PEM", TEST_PEM_TEXT);
     try map.put("WX_TEST_EMPTY", "");
-    const environ = std.process.Environ{ .block = try map.createPosixBlock(gpa, .{}) };
-    defer environ.block.deinit(gpa);
 
     {
-        const got = try read(gpa, undefined, .{ .env = .{ .name = "WX_TEST_PRIV_PEM", .environ = environ } });
+        const got = try read(gpa, undefined, .{ .env = .{ .name = "WX_TEST_PRIV_PEM", .map = &map } });
         defer gpa.free(got);
         try std.testing.expectEqualStrings(TEST_PEM_TEXT, got);
     }
     {
-        const got = try read(gpa, undefined, .{ .env = .{ .name = "WX_TEST_EMPTY", .environ = environ } });
+        const got = try read(gpa, undefined, .{ .env = .{ .name = "WX_TEST_EMPTY", .map = &map } });
         defer gpa.free(got);
         try std.testing.expectEqualStrings("", got);
     }
     // 缺变量:报 EnvironmentVariableMissing,不回显任何材料
-    try std.testing.expectError(error.EnvironmentVariableMissing, read(gpa, undefined, .{ .env = .{ .name = "WX_TEST_MISSING", .environ = environ } }));
+    try std.testing.expectError(error.EnvironmentVariableMissing, read(gpa, undefined, .{ .env = .{ .name = "WX_TEST_MISSING", .map = &map } }));
 }
 
 test "read(file) reads PEM bytes from a temp file" {
@@ -99,7 +102,8 @@ test "read(file) reads PEM bytes from a temp file" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const path = "/tmp/zig_wechat_sdk_credential_test.pem";
+    // 相对 cwd 的临时文件,/tmp/ 在 Windows 不存在;保持跨平台可读写。
+    const path = "zig_wechat_sdk_credential_test.tmp.pem";
     const cwd = std.Io.Dir.cwd();
     try cwd.writeFile(io, .{ .sub_path = path, .data = TEST_PEM_TEXT });
     defer cwd.deleteFile(io, path) catch {};
