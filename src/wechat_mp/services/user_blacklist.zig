@@ -1,25 +1,53 @@
-//! 用户黑名单服务 —— 对应 Java `api.WxMpUserBlacklistService` +
-//! `api.impl.WxMpUserBlacklistServiceImpl`,端点常量取自 `enums.WxMpApiUrl.UserBlacklist`。
+//! 用户黑名单服务 —— 逐字对齐 Java `api.WxMpUserBlacklistService`(3 方法)+
+//! `api.impl.WxMpUserBlacklistServiceImpl`。方法名沿用 Java 的 camelCase(rule 2)。
 //!
-//! 样板见 `services/user.zig`(组合 parent Service、拼 uri → svc.post → 解析 JSON → WxResult)。
+//! 底座(rule 3):所有 URL 路径来自 `../api_url.zig:UserBlacklist`,经 `api()`(=
+//! `api_url.url(Host.api, path)`)拼绝对 URL;移除旧 `service.zig:ApiUrl.*` 用法。
+//! 三方法均为「无 query 的 POST」,不涉及手工 query 组包;Service.execute* 统一注入
+//! access_token 并折叠 errcode(Java `execute(SimplePostRequestExecutor,..)` 亦经
+//! `executeInternal` 注入 token,见 BaseWxMpServiceImpl:432)。
+//!
 //! 逐字对照 Java impl:
-//! - getBlacklist:     POST /cgi-bin/tags/members/getblacklist      {"begin_openid":..}
-//!   → WxMpUserBlacklistGetResult{total,count,data.openid[],next_openid}
-//! - pushToBlacklist:  POST /cgi-bin/tags/members/batchblacklist    {"openid_list":[..]} → void
-//! - pullFromBlacklist:POST /cgi-bin/tags/members/batchunblacklist  {"openid_list":[..]} → void
+//!   getBlacklist:      POST cgi-bin/tags/members/getblacklist {"begin_openid":..}
+//!                      → WxMpUserBlacklistGetResult{total,count,data.openid[],next_openid};
+//!   pushToBlacklist:   POST cgi-bin/tags/members/batchblacklist   {"openid_list":[..]} → void;
+//!   pullFromBlacklist: POST cgi-bin/tags/members/batchunblacklist {"openid_list":[..]} → void。
+//!
+//! 内存所有权(全部 gpa 拥有):`Blacklist` 用 `deinit()`;`.err` 用 `WxError.deinit()`。
+//! `h.strArrayBody` 仅复用 sub_util 的纯 JSON 组包助手(无 URL 逻辑)。
 const std = @import("std");
 const testing = std.testing;
+
 const json_util = @import("common").json_util;
 const result_mod = @import("common").result;
+pub const WxResult = result_mod.WxResult;
+pub const Done = result_mod.Done;
+const WxError = result_mod.WxError;
+
+const api_url = @import("../api_url.zig");
 const service_mod = @import("../service.zig");
 const h = @import("sub_util.zig");
 
-pub const WxResult = result_mod.WxResult;
-pub const Done = result_mod.Done;
+// 复用 strArrayBody + 离线测试脚手架(Recorder/Fixture)
 
-/// 黑名单列表结果 —— 微信官方响应 {total,count,data:{openid:[...]},next_openid}
-/// (口径同 `user.zig#Followers`;Java `WxMpUserBlacklistGetResult` 的 total/count/
-/// openidList/nextOpenid 由 WxMpGsonBuilder 映射自同一份响应)。全部 gpa 拥有,用毕 deinit。
+/// host+path 绝对 URL,路径取自 `api_url.zig:UserBlacklist`(comptime,无分配,无需 free)。
+fn api(comptime path: []const u8) []const u8 {
+    return api_url.url(api_url.Host.api, path);
+}
+
+/// POST 且只关心 errcode:成功即完成(errcode!=0 已在 Service 折叠为 .err)。
+fn postVoid(self: *UserBlacklistService, io: std.Io, comptime path: []const u8, body: []const u8) Done {
+    const resp = switch (self.svc.post(io, api(path), &.{}, body)) {
+        .ok => |b| b,
+        .err => |e| return .{ .err = e },
+    };
+    self.svc.gpa.free(resp);
+    return .{ .ok = {} };
+}
+
+/// 黑名单列表结果 —— 微信官方响应 {total,count,data:{openid:[...]},next_openid},
+/// 对应 Java `WxMpUserBlacklistGetResult`(total/count/openidList/nextOpenid 由
+/// WxMpGsonBuilder 映射自同一份响应)。全部 gpa 拥有,用毕 deinit。
 pub const Blacklist = struct {
     gpa: std.mem.Allocator,
     total: i64 = 0,
@@ -62,56 +90,58 @@ pub const Blacklist = struct {
 pub const UserBlacklistService = struct {
     svc: *service_mod.Service,
 
-    /// 对应 `WxMpUserBlacklistServiceImpl#getBlacklist(nextOpenid)`。
-    /// Java impl: `jsonObject.addProperty("begin_openid", nextOpenid)` —— 字段名逐字一致。
+    /// `WxMpUserBlacklistServiceImpl#getBlacklist(nextOpenid)` (接口 :24 / impl :26-32)。
+    /// Java `jsonObject.addProperty("begin_openid", nextOpenid)` —— 字段名逐字一致。
+    /// POST getblacklist → 解析 WxMpUserBlacklistGetResult.fromJson。
     pub fn getBlacklist(self: *UserBlacklistService, io: std.Io, next_openid: []const u8) WxResult(Blacklist) {
         const gpa = self.svc.gpa;
         var ob = json_util.ObjectBuilder.init(gpa);
         defer ob.deinit();
         ob.putStr("begin_openid", next_openid) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         const body = ob.toJson() catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
 
-        const resp = switch (h.apiPost(self.svc, io, service_mod.ApiUrl.blacklist_get.asUri(), body)) {
+        const resp = switch (self.svc.post(io, api(api_url.UserBlacklist.getblacklist), &.{}, body)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
         defer gpa.free(resp);
         const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "getblacklist not json", .{}),
+            .err = WxError.transport(gpa, "getblacklist not json", .{}),
         };
         defer parsed.deinit();
         const r = Blacklist.fromJson(gpa, parsed.value) catch return .{
-            .err = result_mod.WxError.transport(gpa, "getblacklist parse failed", .{}),
+            .err = WxError.transport(gpa, "getblacklist parse failed", .{}),
         };
         return .{ .ok = r };
     }
 
-    /// 对应 `pushToBlacklist(openidList)`:Java impl `map.put("openid_list", openidList)`。
+    /// `pushToBlacklist(openidList)` (接口 :35 / impl :35-40):Java `map.put("openid_list", list)`。
+    /// POST batchblacklist {"openid_list":[..]} → void(Done)。
     pub fn pushToBlacklist(self: *UserBlacklistService, io: std.Io, openids: []const []const u8) Done {
         const gpa = self.svc.gpa;
         const body = h.strArrayBody(gpa, "openid_list", openids) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-        return h.postVoid(self.svc, io, service_mod.ApiUrl.blacklist_batch.asUri(), body);
+        return postVoid(self, io, api_url.UserBlacklist.batchblacklist, body);
     }
 
-    /// 对应 `pullFromBlacklist(openidList)`:Java impl 同样 `{"openid_list":[...]}`。
+    /// `pullFromBlacklist(openidList)` (接口 :46 / impl :43-48):同样 {"openid_list":[..]}。
+    /// POST batchunblacklist → void(Done)。
     pub fn pullFromBlacklist(self: *UserBlacklistService, io: std.Io, openids: []const []const u8) Done {
         const gpa = self.svc.gpa;
         const body = h.strArrayBody(gpa, "openid_list", openids) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-        return h.postVoid(self.svc, io, service_mod.ApiUrl.blacklist_unbatch.asUri(), body);
+        return postVoid(self, io, api_url.UserBlacklist.batchunblacklist, body);
     }
 };
 
 // ---------------------------------------------------------------------------
 // 契约测试:URL / HTTP 方法 / 请求体 / 响应字段,逐字对照
 // WxMpApiUrl.UserBlacklist 常量 + WxMpUserBlacklistServiceImpl + 微信响应字段
-// (test resources 无同名 JSON fixture,故用 Java 源码里明确的字段名/常量断言)
 // ---------------------------------------------------------------------------
 
 test "UserBlacklist 契约: 3 端点 URL/method/请求体/响应字段 (WxMpApiUrl.UserBlacklist)" {
@@ -177,4 +207,26 @@ test "UserBlacklist 契约: 3 端点 URL/method/请求体/响应字段 (WxMpApiU
     }
     try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/tags/members/batchunblacklist") != null);
     try testing.expect(std.mem.indexOf(u8, mock.body(), "\"openid_list\":[\"o9\"]") != null);
+}
+
+// 追加:空 openid 列表 + errcode!=0 折叠为 .err(Java 抛 WxErrorException)。
+test "UserBlacklist: 空列表请求体 + errcode 折叠" {
+    const gpa = testing.allocator;
+    var mock = h.Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "batchblacklist", .response = "{\"errcode\":40003,\"errmsg\":\"invalid openid\"}" },
+    } };
+    var fx: h.Fixture = undefined;
+    try h.setup(gpa, &mock, &fx);
+    defer h.teardown(&fx);
+    var svc = UserBlacklistService{ .svc = &fx.svc };
+
+    switch (svc.pushToBlacklist(fx.threaded.io(), &.{})) {
+        .ok => return error.Unexpected,
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            try testing.expectEqual(@as(i64, 40003), err.error_code);
+        },
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"openid_list\":[]") != null);
 }

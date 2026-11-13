@@ -1,23 +1,85 @@
-//! 模板消息服务 —— 对应 Java `api.WxMpTemplateMsgService` + `api.impl.WxMpTemplateMsgServiceImpl`。
+//! 模板消息服务 —— 逐字对齐 Java `api.WxMpTemplateMsgService`(7 方法)
+//! + `api.impl.WxMpTemplateMsgServiceImpl`。
 //!
-//! 子服务样板(参照 `user.zig`):结构体持有 parent `Service` 引用(组合而非继承),
-//! 方法 = 拼 uri → service.get/post → json_util 解析成结果结构。
-//! URL 以 Java 枚举 `enums.WxMpApiUrl.TemplateMsg` 为准:
-//! - MESSAGE_TEMPLATE_SEND             → cgi-bin/message/template/send
-//! - TEMPLATE_API_SET_INDUSTRY         → cgi-bin/template/api_set_industry
-//! - TEMPLATE_GET_INDUSTRY             → cgi-bin/template/get_industry
-//! - TEMPLATE_API_ADD_TEMPLATE         → cgi-bin/template/api_add_template
-//! - TEMPLATE_GET_ALL_PRIVATE_TEMPLATE → cgi-bin/template/get_all_private_template
-//! - TEMPLATE_DEL_PRIVATE_TEMPLATE     → cgi-bin/template/del_private_template
+//! 命名:全部采用 Java 的 camelCase 方法名(rule 2)。Java 的 `addTemplate` 两个重载
+//! 用 Zig 惯用法映射为一个函数 + 可选 `keyword_name_list`(rule 1):
+//!   - `addTemplate(String)`                       → `addTemplate(io, short_id, null)`
+//!   - `addTemplate(String, List<String>)`         → `addTemplate(io, short_id, &.{...})`
+//!
+//! 底座(rule 3):
+//!   - 所有 URL 路径来自 `../api_url.zig:TemplateMsg`,经 `api()`(= `api_url.url(Host.api, path)`)
+//!     拼成绝对 URL;旧 `service_mod.api_host_url`/`apiUri`/本地 `Path` 全部移除;
+//!   - 扁平 JSON 请求体(setIndustry / delPrivateTemplate / addTemplate)用
+//!     `common.json_util.ObjectBuilder`;复杂嵌套消息体 `TemplateMessage.toJson` 仍用
+//!     `std.Io.Writer.Allocating`(与 `user.zig` 的 batchGetBody 同构);
+//!   - 本服务 6 个端点均无 query 参数,故无需 `mp_helpers.buildUrl`(它用于订阅服务里
+//!     带 query 的端点);`Service.execute*` 已折叠 errcode→`.err` 并注入 access_token。
+//!
+//! Java↔Zig 语言差异(已按 Java 逻辑取舍,逐条说明):
+//!   - `setIndustry`: Java 入参 `WxMpTemplateIndustry`,其 `WxMpIndustryGsonAdapter#serialize`
+//!     只取 primary/second 两个枚举的 `code`(Integer)→ `{"industry_id1":N,"industry_id2":N}`。
+//!     **旧 Zig 误拼成 `{"primary_industry","secondary_industry"}` 且值为名称,本轮纠正为
+//!     industry_id1/industry_id2 数值**。Zig 直接以两个 `i64` code 表达(去掉枚举查表,
+//!     类型系统天然保证「行业Id不能为空」这条 Java 运行时校验)。
+//!   - `getIndustry`: Java `WxMpIndustryGsonAdapter#deserialize` 读 `primary_industry` /
+//!     `secondary_industry` 两个对象里的 `first_class`/`second_class`,本轮原样保留原始
+//!     文字(比 Java 反查枚举更贴近报文,且是「创建/获取数据结构不一样」的如实映射)。
+//!   - `getAllPrivateTemplate`: Java `WxMpTemplate` 的二级行业字段名是 `deputy_industry`
+//!     (`@SerializedName`),**旧 Zig 误作 `secondary_industry`,本轮纠正**。
+//!   - `sendTemplateMsg` 的 `msgid`、addTemplate 的 `template_id`:Java Gson `getAsString`
+//!     数字/字符串都能取,本轮兼容二者且恒定返回 gpa 拥有串(缺失时 dupe 空串),
+//!     避免调用方 free 静态串。
+//!
+//! 内存所有权(全部 gpa 拥有,调用方负责):
+//!   - `[]const u8` 裸结果(msgid / template_id):`gpa.free()`;
+//!   - `Industry`:`deinit()`(两个 IndustryClass 的字符串);
+//!   - `[]TemplateInfo`:逐元素 `deinit()` + `free(slice)`(len!=0 时);
+//!   - `.err` 载荷为 `WxError`,用毕 `WxError.deinit()`。
 const std = @import("std");
+const testing = std.testing;
+
+const error_mod = @import("common").error_util;
 const json_util = @import("common").json_util;
 const result_mod = @import("common").result;
-const service_mod = @import("../service.zig");
-
 pub const WxResult = result_mod.WxResult;
 pub const Done = result_mod.Done;
+const WxError = result_mod.WxError;
+const token_mod = @import("common").token;
 
-/// 行业一/二级分类 —— 对应 Java `bean.template.WxMpTemplateIndustry.Industry`
+const api_url = @import("../api_url.zig");
+const config_mod = @import("../config.zig");
+const http_mod = @import("../http.zig");
+const service_mod = @import("../service.zig");
+
+/// host+path 绝对 URL,路径全部取自 `api_url.zig:TemplateMsg`(comptime,无分配,无需 free)。
+fn api(comptime path: []const u8) []const u8 {
+    return api_url.url(api_url.Host.api, path);
+}
+
+/// JSON 字符串编码(手写消息体复用,与 `user.zig` 的 jw.str 同构)。
+fn encStr(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    try std.json.Stringify.encodeJsonString(s, .{ .escape_unicode = false }, w);
+}
+
+/// 取 JSON 字符串字段并 dupe 成 gpa 拥有(缺失返回 null)。对应 Java `GsonHelper.getString`。
+fn dupeStr(gpa: std.mem.Allocator, v: json_util.Value, key: []const u8) !?[]const u8 {
+    const s = json_util.getStr(v, key) orelse return null;
+    return try gpa.dupe(u8, s);
+}
+
+/// msgid 可能是字符串也可能是数字(Java Gson `getAsString` 两种都能取),统一 dupe 成
+/// gpa 拥有的字符串;缺失时 dupe 空串,保证调用方 `gpa.free` 始终合法。
+fn msgIdFromJson(gpa: std.mem.Allocator, v: json_util.Value) ![]const u8 {
+    if (json_util.getStr(v, "msgid")) |s| return try gpa.dupe(u8, s);
+    if (json_util.getInt(v, "msgid")) |n| return try std.fmt.allocPrint(gpa, "{d}", .{n});
+    return try gpa.dupe(u8, "");
+}
+
+// ---------------------------------------------------------------------------
+// 结果结构(全部 gpa 拥有,用毕 deinit)
+// ---------------------------------------------------------------------------
+
+/// 行业一/二级分类 —— 对应 Java `WxMpTemplateIndustry.Industry` 反序列化形态
 /// (get_industry 响应里的 {first_class, second_class},全部 gpa 拥有)。
 pub const IndustryClass = struct {
     gpa: std.mem.Allocator,
@@ -53,13 +115,15 @@ pub const Industry = struct {
     }
 };
 
-/// 私有模板列表项 —— 对应 Java `bean.template.WxMpTemplate`(全部 gpa 拥有)。
+/// 私有模板列表项 —— 对应 Java `bean.template.WxMpTemplate`
+/// (@SerializedName: template_id/title/primary_industry/deputy_industry/content/example,
+/// 全部 gpa 拥有)。
 pub const TemplateInfo = struct {
     gpa: std.mem.Allocator,
     template_id: []const u8 = "",
     title: []const u8 = "",
     primary_industry: ?[]const u8 = null,
-    secondary_industry: ?[]const u8 = null,
+    deputy_industry: ?[]const u8 = null,
     content: ?[]const u8 = null,
     example: ?[]const u8 = null,
 
@@ -69,7 +133,7 @@ pub const TemplateInfo = struct {
             self.template_id,
             self.title,
             self.primary_industry,
-            self.secondary_industry,
+            self.deputy_industry,
             self.content,
             self.example,
         }) |s| if (s) |v| g.free(@constCast(v));
@@ -88,7 +152,7 @@ pub const TemplateInfo = struct {
         };
         errdefer t.deinit();
         t.primary_industry = try optDupe(gpa, v, "primary_industry");
-        t.secondary_industry = try optDupe(gpa, v, "secondary_industry");
+        t.deputy_industry = try optDupe(gpa, v, "deputy_industry");
         t.content = try optDupe(gpa, v, "content");
         t.example = try optDupe(gpa, v, "example");
         return t;
@@ -110,58 +174,55 @@ pub const MiniProgram = struct {
     use_path: bool = false,
 };
 
-/// 待发送模板消息 —— 对应 Java `bean.template.WxMpTemplateMessage`。
+/// 待发送模板消息 —— 对应 Java `bean.template.WxMpTemplateMessage`
+/// (toUser/templateId/url/miniProgram/clientMsgId/data;Java 无 topurl 字段,本轮去除)。
 pub const TemplateMessage = struct {
     to_user: []const u8,
     template_id: []const u8,
     url: ?[]const u8 = null,
-    top_url: ?[]const u8 = null,
     client_msg_id: ?[]const u8 = null,
     mini_program: ?MiniProgram = null,
     data: []const TemplateData = &.{},
 
-    /// 序列化为请求体 JSON —— 对应 Java `WxMpTemplateMessageGsonAdapter#serialize`:
-    /// `{touser, template_id, url?, topurl?, client_msg_id?,
-    ///   miniprogram{appid, pagepath|path}?, data:{key:{value,color?}}}`。
+    /// 序列化为请求体 JSON —— 对应 `WxMpTemplateMessageGsonAdapter#serialize`:
+    /// `{touser, template_id, client_msg_id?(非空), url?, miniprogram{appid, pagepath|path}?,
+    ///   data:{key:{value,color?}}}`。
     fn toJson(gpa: std.mem.Allocator, m: TemplateMessage) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(gpa);
         errdefer out.deinit();
         const w = &out.writer;
-        const opts = std.json.Stringify.Options{ .escape_unicode = false };
 
         try w.writeAll("{\"touser\":");
-        try std.json.Stringify.encodeJsonString(m.to_user, opts, w);
+        try encStr(w, m.to_user);
         try w.writeAll(",\"template_id\":");
-        try std.json.Stringify.encodeJsonString(m.template_id, opts, w);
+        try encStr(w, m.template_id);
+        if (m.client_msg_id) |c| {
+            if (c.len > 0) { // Java: StringUtils.isNotBlank
+                try w.writeAll(",\"client_msg_id\":");
+                try encStr(w, c);
+            }
+        }
         if (m.url) |u| {
             try w.writeAll(",\"url\":");
-            try std.json.Stringify.encodeJsonString(u, opts, w);
-        }
-        if (m.top_url) |u| {
-            try w.writeAll(",\"topurl\":");
-            try std.json.Stringify.encodeJsonString(u, opts, w);
-        }
-        if (m.client_msg_id) |c| {
-            try w.writeAll(",\"client_msg_id\":");
-            try std.json.Stringify.encodeJsonString(c, opts, w);
+            try encStr(w, u);
         }
         if (m.mini_program) |mp| {
             try w.writeAll(",\"miniprogram\":{\"appid\":");
-            try std.json.Stringify.encodeJsonString(mp.appid, opts, w);
+            try encStr(w, mp.appid);
             try w.writeAll(if (mp.use_path) ",\"path\":" else ",\"pagepath\":");
-            try std.json.Stringify.encodeJsonString(mp.page_path, opts, w);
+            try encStr(w, mp.page_path);
             try w.writeByte('}');
         }
         // data:{name:{value,color?}},对应适配器里遍历 WxMpTemplateData 的循环
         try w.writeAll(",\"data\":{");
         for (m.data, 0..) |d, i| {
             if (i != 0) try w.writeByte(',');
-            try std.json.Stringify.encodeJsonString(d.name, opts, w);
+            try encStr(w, d.name);
             try w.writeAll(":{\"value\":");
-            try std.json.Stringify.encodeJsonString(d.value, opts, w);
+            try encStr(w, d.value);
             if (d.color) |c| {
                 try w.writeAll(",\"color\":");
-                try std.json.Stringify.encodeJsonString(c, opts, w);
+                try encStr(w, c);
             }
             try w.writeByte('}');
         }
@@ -170,77 +231,93 @@ pub const TemplateMessage = struct {
     }
 };
 
-/// msgid 可能是字符串也可能是数字(Java Gson `getAsString` 两种都能取),统一转字符串。
-fn numOrStrDupe(gpa: std.mem.Allocator, v: json_util.Value, key: []const u8) !?[]const u8 {
-    if (json_util.getStr(v, key)) |s| return try gpa.dupe(u8, s);
-    if (json_util.getInt(v, key)) |n| return try std.fmt.allocPrint(gpa, "{d}", .{n});
-    return null;
+/// `template_list` 数组 → `[]TemplateInfo`(对应 `WxMpTemplate.fromJson` 取 template_list)。
+fn parseTemplateList(gpa: std.mem.Allocator, root: json_util.Value) ![]TemplateInfo {
+    const arr = json_util.getArray(root, "template_list") orelse return &[_]TemplateInfo{};
+    var list: std.ArrayList(TemplateInfo) = .empty;
+    errdefer {
+        for (list.items) |*t| {
+            var tmp = t.*;
+            tmp.deinit();
+        }
+        list.deinit(gpa);
+    }
+    for (arr.items) |item| try list.append(gpa, try TemplateInfo.fromJson(gpa, item));
+    return list.toOwnedSlice(gpa);
 }
 
-/// 拼 api.weixin.qq.com 前缀(uri 交给调用方 free)。
-fn apiUri(gpa: std.mem.Allocator, path: []const u8) WxResult([]u8) {
-    return .{ .ok = std.fmt.allocPrint(gpa, "{s}{s}", .{ service_mod.api_host_url, path }) catch
-        return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) } };
+/// `{"template_id_short":"..","keyword_name_list":["..",...]}` —— 对应 Java
+/// `addTemplate(shortTemplateId, keywordNameList)` 里 Gson JsonObject + JsonArray 的组包。
+fn buildAddTemplateBody(gpa: std.mem.Allocator, short_id: []const u8, keywords: []const []const u8) ![]u8 {
+    var arr: std.ArrayList(json_util.Value) = .empty;
+    defer arr.deinit(gpa);
+    for (keywords) |k| try arr.append(gpa, .{ .string = k });
+    var ob = json_util.ObjectBuilder.init(gpa);
+    defer ob.deinit();
+    try ob.putStr("template_id_short", short_id);
+    // ArrayList 按值拷进 map,底层缓冲仍由上面的 `arr` 释放一次
+    try ob.putValue("keyword_name_list", .{ .array = arr });
+    return ob.toJson();
 }
 
-fn apiGet(svc: *service_mod.Service, io: std.Io, path: []const u8) WxResult([]u8) {
-    const uri = switch (apiUri(svc.gpa, path)) {
-        .ok => |u| u,
-        .err => |e| return .{ .err = e },
-    };
-    defer svc.gpa.free(uri);
-    return svc.get(io, uri, &.{});
+// ---------------------------------------------------------------------------
+// 请求/响应辅助(host → svc.get/post,token 附加 + errcode 折叠 + 重试都在 Service)
+// ---------------------------------------------------------------------------
+
+fn apiGet(self: *TemplateMsgService, io: std.Io, comptime path: []const u8) WxResult([]u8) {
+    return self.svc.get(io, api(path), &.{});
 }
 
-fn apiPost(svc: *service_mod.Service, io: std.Io, path: []const u8, body: []const u8) WxResult([]u8) {
-    const uri = switch (apiUri(svc.gpa, path)) {
-        .ok => |u| u,
-        .err => |e| return .{ .err = e },
-    };
-    defer svc.gpa.free(uri);
-    return svc.post(io, uri, &.{}, body);
+fn apiPost(self: *TemplateMsgService, io: std.Io, comptime path: []const u8, body: []const u8) WxResult([]u8) {
+    return self.svc.post(io, api(path), &.{}, body);
 }
 
 /// POST 且只关心 errcode:成功即完成(errcode!=0 已在 `Service.executeInternal` 折叠为 .err)。
-fn postVoid(svc: *service_mod.Service, io: std.Io, path: []const u8, body: []const u8) Done {
-    const resp = switch (apiPost(svc, io, path, body)) {
+fn postVoid(self: *TemplateMsgService, io: std.Io, comptime path: []const u8, body: []const u8) Done {
+    const resp = switch (apiPost(self, io, path, body)) {
         .ok => |b| b,
         .err => |e| return .{ .err = e },
     };
-    svc.gpa.free(resp);
+    self.svc.gpa.free(resp);
     return .{ .ok = {} };
 }
+
+// ---------------------------------------------------------------------------
+// TemplateMsgService —— 对应 Java `WxMpTemplateMsgService`(7 方法) + Impl
+// ---------------------------------------------------------------------------
 
 pub const TemplateMsgService = struct {
     svc: *service_mod.Service,
 
-    /// 对应 `WxMpTemplateMsgServiceImpl#setIndustry`:
-    /// POST cgi-bin/template/api_set_industry {primary_industry, secondary_industry}。
-    pub fn setIndustry(self: *TemplateMsgService, io: std.Io, primary: []const u8, secondary: []const u8) Done {
+    /// `WxMpTemplateMsgService.setIndustry(WxMpTemplateIndustry)` (接口 :46 / impl :44-52)。
+    /// POST cgi-bin/template/api_set_industry,body = `WxMpIndustryGsonAdapter#serialize`
+    /// 产出的 `{"industry_id1":N,"industry_id2":N}`(两个行业 code);返回 Done。
+    /// Java 对 null code 抛 IllegalArgumentException,Zig 以 `i64` 参数在类型层规避。
+    pub fn setIndustry(self: *TemplateMsgService, io: std.Io, industry_id1: i64, industry_id2: i64) Done {
         const gpa = self.svc.gpa;
         var ob = json_util.ObjectBuilder.init(gpa);
         defer ob.deinit();
-        const body = build: {
-            ob.putStr("primary_industry", primary) catch break :build null;
-            ob.putStr("secondary_industry", secondary) catch break :build null;
-            break :build ob.toJson() catch null;
-        } orelse return .{ .err = result_mod.WxError.internal(gpa, "build set_industry body", .{}) };
+        ob.putInt("industry_id1", industry_id1) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        ob.putInt("industry_id2", industry_id2) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        const body = ob.toJson() catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-        return postVoid(self.svc, io, "cgi-bin/template/api_set_industry", body);
+        return postVoid(self, io, api_url.TemplateMsg.template_api_set_industry, body);
     }
 
-    /// 对应 `WxMpTemplateMsgServiceImpl#getIndustry`:
-    /// GET cgi-bin/template/get_industry → 解析 primary/secondary_industry。
+    /// `WxMpTemplateMsgService.getIndustry()` (接口 :67 / impl :55-58)。
+    /// GET cgi-bin/template/get_industry → `WxMpTemplateIndustry.fromJson` → Industry。
     pub fn getIndustry(self: *TemplateMsgService, io: std.Io) WxResult(Industry) {
         const gpa = self.svc.gpa;
-        const resp = switch (apiGet(self.svc, io, "cgi-bin/template/get_industry")) {
+        const resp = switch (apiGet(self, io, api_url.TemplateMsg.template_get_industry)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
         defer gpa.free(resp);
-
         const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "get_industry not json", .{}),
+            .err = WxError.transport(gpa, "get_industry not json", .{}),
         };
         defer parsed.deinit();
 
@@ -248,141 +325,105 @@ pub const TemplateMsgService = struct {
         errdefer ind.deinit();
         if (json_util.objectOf(parsed.value, "primary_industry")) |o| {
             ind.primary = IndustryClass.fromObj(gpa, o) catch return .{
-                .err = result_mod.WxError.internal(gpa, "oom", .{}),
+                .err = WxError.internal(gpa, "oom", .{}),
             };
         }
         if (json_util.objectOf(parsed.value, "secondary_industry")) |o| {
             ind.secondary = IndustryClass.fromObj(gpa, o) catch return .{
-                .err = result_mod.WxError.internal(gpa, "oom", .{}),
+                .err = WxError.internal(gpa, "oom", .{}),
             };
         }
         return .{ .ok = ind };
     }
 
-    fn parseTemplateList(gpa: std.mem.Allocator, root: json_util.Value) ![]TemplateInfo {
-        const arr = json_util.getArray(root, "template_list") orelse return &[_]TemplateInfo{};
-        var list: std.ArrayList(TemplateInfo) = .empty;
-        errdefer {
-            for (list.items) |*t| {
-                var tmp = t.*;
-                tmp.deinit();
-            }
-            list.deinit(gpa);
-        }
-        for (arr.items) |item| try list.append(gpa, try TemplateInfo.fromJson(gpa, item));
-        return list.toOwnedSlice(gpa);
-    }
-
-    /// 对应 `WxMpTemplateMsgServiceImpl#getAllPrivateTemplate`:
-    /// GET cgi-bin/template/get_all_private_template → 解析 template_list 数组。
-    /// 所有权:切片逐元素 deinit;`len != 0` 时由调用方 `free` 切片本身。
-    pub fn getPrivateTemplates(self: *TemplateMsgService, io: std.Io) WxResult([]TemplateInfo) {
+    /// `WxMpTemplateMsgService.getAllPrivateTemplate()` (接口 :161 / impl :85-87)。
+    /// GET cgi-bin/template/get_all_private_template → 解析 `template_list` 数组。
+    /// 所有权:切片逐元素 `TemplateInfo.deinit()`;`len != 0` 时再 `free(slice)` 本身。
+    pub fn getAllPrivateTemplate(self: *TemplateMsgService, io: std.Io) WxResult([]TemplateInfo) {
         const gpa = self.svc.gpa;
-        const resp = switch (apiGet(self.svc, io, "cgi-bin/template/get_all_private_template")) {
+        const resp = switch (apiGet(self, io, api_url.TemplateMsg.template_get_all_private_template)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
         defer gpa.free(resp);
-
         const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "get_all_private_template not json", .{}),
+            .err = WxError.transport(gpa, "get_all_private_template not json", .{}),
         };
         defer parsed.deinit();
-
         const list = parseTemplateList(gpa, parsed.value) catch return .{
-            .err = result_mod.WxError.internal(gpa, "parse template list failed", .{}),
+            .err = WxError.internal(gpa, "parse template list failed", .{}),
         };
         return .{ .ok = list };
     }
 
-    /// 对应 `WxMpTemplateMsgServiceImpl#delPrivateTemplate`:
-    /// POST cgi-bin/template/del_private_template {template_id}。
+    /// `WxMpTemplateMsgService.delPrivateTemplate(templateId)` (接口 :184 / impl :90-100)。
+    /// POST cgi-bin/template/del_private_template {"template_id"} → Done。
     pub fn delPrivateTemplate(self: *TemplateMsgService, io: std.Io, template_id: []const u8) Done {
         const gpa = self.svc.gpa;
         var ob = json_util.ObjectBuilder.init(gpa);
         defer ob.deinit();
-        const body = build: {
-            ob.putStr("template_id", template_id) catch break :build null;
-            break :build ob.toJson() catch null;
-        } orelse return .{ .err = result_mod.WxError.internal(gpa, "build del_private_template body", .{}) };
+        ob.putStr("template_id", template_id) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        const body = ob.toJson() catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-        return postVoid(self.svc, io, "cgi-bin/template/del_private_template", body);
+        return postVoid(self, io, api_url.TemplateMsg.template_del_private_template, body);
     }
 
-    fn buildAddTemplateBody(gpa: std.mem.Allocator, short_id: []const u8, keywords: []const []const u8) ![]u8 {
-        var arr: std.ArrayList(json_util.Value) = .empty;
-        defer arr.deinit(gpa);
-        for (keywords) |k| try arr.append(gpa, .{ .string = k });
-        var ob = json_util.ObjectBuilder.init(gpa);
-        defer ob.deinit();
-        try ob.putStr("template_id_short", short_id);
-        // 注意:ArrayList 按值拷进 map,底层缓冲仍由上面的 `arr` 释放一次
-        try ob.putValue("keyword_name_list", .{ .array = arr });
-        return ob.toJson();
-    }
-
-    /// 对应 `WxMpTemplateMsgServiceImpl#addTemplate(shortTemplateId, keywordNameList)`:
-    /// POST cgi-bin/template/api_add_template {template_id_short, keyword_name_list}
-    /// → 返回 template_id(allocator 复制,所有权归调用方,用毕 free)。
-    pub fn addTemplate(self: *TemplateMsgService, io: std.Io, short_template_id: []const u8, keyword_name_list: []const []const u8) WxResult([]const u8) {
+    /// `WxMpTemplateMsgService.addTemplate(String)` (接口 :114,deprecated) /
+    /// `addTemplate(String, List<String>)` (接口 :139,impl :66-82) —— 合并为一个函数 + 可选
+    /// keyword_name_list(rule 1)。`null` 等价于 Java 的 `Collections.emptyList()`。
+    /// POST cgi-bin/template/api_add_template
+    /// `{"template_id_short":"..","keyword_name_list":[...]}` → 返回 template_id。
+    /// 所有权:返回 `[]const u8` 由 gpa 拥有,调用方 `gpa.free()`。
+    pub fn addTemplate(self: *TemplateMsgService, io: std.Io, short_template_id: []const u8, keyword_name_list: ?[]const []const u8) WxResult([]const u8) {
         const gpa = self.svc.gpa;
-        const body = buildAddTemplateBody(gpa, short_template_id, keyword_name_list) catch |e| return .{
-            .err = result_mod.WxError.internal(gpa, "build add_template body: {s}", .{@errorName(e)}),
+        const body = buildAddTemplateBody(gpa, short_template_id, keyword_name_list orelse &.{}) catch |e| return .{
+            .err = WxError.internal(gpa, "build add_template body: {s}", .{@errorName(e)}),
         };
         defer gpa.free(body);
-
-        const resp = switch (apiPost(self.svc, io, "cgi-bin/template/api_add_template", body)) {
+        const resp = switch (apiPost(self, io, api_url.TemplateMsg.template_api_add_template, body)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
         defer gpa.free(resp);
-
         const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "add_template not json", .{}),
+            .err = WxError.transport(gpa, "add_template not json", .{}),
         };
         defer parsed.deinit();
         const tid = gpa.dupe(u8, json_util.getStrOr(parsed.value, "template_id", "")) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         return .{ .ok = tid };
     }
 
-    /// 对应 `WxMpTemplateMsgServiceImpl#sendTemplateMsg`:
-    /// POST cgi-bin/message/template/send,成功返回 msgid
-    /// (Java 用 `jsonObject.get("msgid").getAsString()`,数字/字符串均可)。
-    /// 所有权:msgid 由 allocator 复制,调用方用毕 free。
-    pub fn send(self: *TemplateMsgService, io: std.Io, msg: TemplateMessage) WxResult([]const u8) {
+    /// `WxMpTemplateMsgService.sendTemplateMsg(templateMessage)` (接口 :89 / impl :34-41)。
+    /// POST cgi-bin/message/template/send,body = `templateMessage.toJson()`;解析 `msgid`
+    /// (Java `get("msgid").getAsString()`,数字/字符串均可)。所有权:调用方 `gpa.free()`。
+    pub fn sendTemplateMsg(self: *TemplateMsgService, io: std.Io, msg: TemplateMessage) WxResult([]const u8) {
         const gpa = self.svc.gpa;
         const body = TemplateMessage.toJson(gpa, msg) catch |e| return .{
-            .err = result_mod.WxError.internal(gpa, "build template send body: {s}", .{@errorName(e)}),
+            .err = WxError.internal(gpa, "build template send body: {s}", .{@errorName(e)}),
         };
         defer gpa.free(body);
-
-        const resp = switch (apiPost(self.svc, io, "cgi-bin/message/template/send", body)) {
+        const resp = switch (apiPost(self, io, api_url.TemplateMsg.message_template_send, body)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
         defer gpa.free(resp);
-
         const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "template send not json", .{}),
+            .err = WxError.transport(gpa, "template send not json", .{}),
         };
         defer parsed.deinit();
-        const msgid = numOrStrDupe(gpa, parsed.value, "msgid") catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        return .{ .ok = msgid orelse "" };
+        const msgid = msgIdFromJson(gpa, parsed.value) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        return .{ .ok = msgid };
     }
 };
 
 // ---------------------------------------------------------------------------
-// 测试:mock RequestExecutor(照 `user.zig` 的 vtable 方式),
-// 额外记录最后一次请求的 method/uri/body 以便断言(固定缓冲,零堆分配)。
+// 离线契约测试(URL / method / 请求体 / 响应字段 / 所有权)
+// 记录型 executor:捕获 method/uri/body,按 uri 子串返回预置响应(取第一个命中)。
 // ---------------------------------------------------------------------------
-
-const testing = std.testing;
-const http_mod = @import("../http.zig");
-const config_mod = @import("../config.zig");
-const token_mod = @import("common").token;
-const error_mod = @import("common").error_util;
 
 const Recorder = struct {
     const Entry = struct { match: []const u8, response: []const u8 };
@@ -457,7 +498,7 @@ fn setup(
     svc.* = service_mod.Service.init(gpa, cfg.config(), mock.executor());
 }
 
-test "template send: 请求体结构 + msgid 解析 + errcode!=0" {
+test "sendTemplateMsg: 请求体结构 + msgid 解析 + errcode!=0 + api_url 绝对 URL" {
     const gpa = testing.allocator;
     var mock = Recorder{ .gpa = gpa, .entries = &.{
         .{ .match = "message/template/send", .response = "{\"errcode\":0,\"errmsg\":\"ok\",\"msgid\":123}" },
@@ -470,7 +511,7 @@ test "template send: 请求体结构 + msgid 解析 + errcode!=0" {
     defer cfg.deinit();
     var svc = TemplateMsgService{ .svc = &base };
 
-    const r = svc.send(threaded.io(), .{
+    const r = svc.sendTemplateMsg(threaded.io(), .{
         .to_user = "oABC",
         .template_id = "TPL1",
         .url = "https://example.com",
@@ -483,7 +524,7 @@ test "template send: 请求体结构 + msgid 解析 + errcode!=0" {
     });
     switch (r) {
         .ok => |msgid| {
-            defer gpa.free(@constCast(msgid));
+            defer gpa.free(msgid);
             try testing.expectEqualStrings("123", msgid);
         },
         .err => |*e| {
@@ -493,7 +534,8 @@ test "template send: 请求体结构 + msgid 解析 + errcode!=0" {
         },
     }
     try testing.expectEqualStrings("post", mock.last_method);
-    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/message/template/send") != null);
+    // URL 来自 api_url.zig:Host.api + TemplateMsg.message_template_send
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "https://api.weixin.qq.com/cgi-bin/message/template/send") != null);
     try testing.expect(std.mem.indexOf(u8, mock.uri(), "access_token=TOK") != null);
     const b = mock.body();
     try testing.expect(std.mem.indexOf(u8, b, "\"touser\":\"oABC\"") != null);
@@ -525,7 +567,7 @@ test "template send: 请求体结构 + msgid 解析 + errcode!=0" {
     defer th2.deinit();
     defer cfg2.deinit();
     var svc2 = TemplateMsgService{ .svc = &base2 };
-    const r2 = svc2.send(th2.io(), .{ .to_user = "o", .template_id = "t" });
+    const r2 = svc2.sendTemplateMsg(th2.io(), .{ .to_user = "o", .template_id = "t" });
     switch (r2) {
         .ok => return error.Unexpected,
         .err => |*e| {
@@ -536,14 +578,13 @@ test "template send: 请求体结构 + msgid 解析 + errcode!=0" {
     }
 }
 
-test "template industry / 模板列表 / 删除 / 添加" {
+test "setIndustry / getIndustry / getAllPrivateTemplate / delPrivateTemplate" {
     const gpa = testing.allocator;
     var mock = Recorder{ .gpa = gpa, .entries = &.{
         .{ .match = "api_set_industry", .response = "{\"errcode\":0,\"errmsg\":\"ok\"}" },
         .{ .match = "get_industry", .response = "{\"errcode\":0,\"primary_industry\":{\"first_class\":\"IT科技\",\"second_class\":\"IT科技|运营商\"},\"secondary_industry\":{\"first_class\":\"教育\",\"second_class\":\"教育|培训\"}}" },
-        .{ .match = "get_all_private_template", .response = "{\"errcode\":0,\"template_list\":[{\"template_id\":\"T1\",\"title\":\"订阅成功通知\",\"primary_industry\":\"IT科技\",\"content\":\"c1\"},{\"template_id\":\"T2\",\"title\":\"t2\"}]}" },
+        .{ .match = "get_all_private_template", .response = "{\"errcode\":0,\"template_list\":[{\"template_id\":\"T1\",\"title\":\"订阅成功通知\",\"primary_industry\":\"IT科技\",\"deputy_industry\":\"互联网|电子商务\",\"content\":\"c1\"},{\"template_id\":\"T2\",\"title\":\"t2\"}]}" },
         .{ .match = "del_private_template", .response = "{\"errcode\":0,\"errmsg\":\"ok\"}" },
-        .{ .match = "api_add_template", .response = "{\"errcode\":0,\"template_id\":\"NEW_TPL\"}" },
     } };
     var threaded: std.Io.Threaded = undefined;
     var cfg: config_mod.InMemoryConfigStorage = undefined;
@@ -554,8 +595,8 @@ test "template industry / 模板列表 / 删除 / 添加" {
     var svc = TemplateMsgService{ .svc = &base };
     const io = threaded.io();
 
-    // set_industry
-    switch (svc.setIndustry(io, "IT科技", "教育")) {
+    // set_industry:WxMpIndustryGsonAdapter 产出 {"industry_id1":N,"industry_id2":N}
+    switch (svc.setIndustry(io, 1, 4)) {
         .ok => {},
         .err => |*e| {
             var err = e.*;
@@ -564,9 +605,11 @@ test "template industry / 模板列表 / 删除 / 添加" {
         },
     }
     try testing.expectEqualStrings("post", mock.last_method);
-    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/template/api_set_industry") != null);
-    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"primary_industry\":\"IT科技\"") != null);
-    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"secondary_industry\":\"教育\"") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "https://api.weixin.qq.com/cgi-bin/template/api_set_industry") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"industry_id1\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"industry_id2\":4") != null);
+    // 旧版误拼的字段不应再出现
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"primary_industry\"") == null);
 
     // get_industry
     switch (svc.getIndustry(io)) {
@@ -582,20 +625,25 @@ test "template industry / 模板列表 / 删除 / 添加" {
             return error.Unexpected;
         },
     }
+    try testing.expectEqualStrings("get", mock.last_method);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/template/get_industry") != null);
 
-    // get_all_private_template
-    switch (svc.getPrivateTemplates(io)) {
+    // get_all_private_template:字段名 deputy_industry(纠正旧版 secondary_industry)
+    switch (svc.getAllPrivateTemplate(io)) {
         .ok => |list| {
-            defer if (list.len != 0) gpa.free(list);
+            defer {
+                for (list) |*t| {
+                    var tmp = t.*;
+                    tmp.deinit();
+                }
+                if (list.len != 0) gpa.free(list);
+            }
             try testing.expectEqual(@as(usize, 2), list.len);
-            var t0 = list[0];
-            defer t0.deinit();
-            try testing.expectEqualStrings("T1", t0.template_id);
-            try testing.expectEqualStrings("订阅成功通知", t0.title);
-            try testing.expectEqualStrings("c1", t0.content.?);
-            var t1 = list[1];
-            defer t1.deinit();
-            try testing.expect(t1.content == null);
+            try testing.expectEqualStrings("T1", list[0].template_id);
+            try testing.expectEqualStrings("订阅成功通知", list[0].title);
+            try testing.expectEqualStrings("互联网|电子商务", list[0].deputy_industry.?);
+            try testing.expectEqualStrings("c1", list[0].content.?);
+            try testing.expect(list[1].content == null);
         },
         .err => |*e| {
             var err = e.*;
@@ -614,8 +662,40 @@ test "template industry / 模板列表 / 删除 / 添加" {
         },
     }
     try testing.expect(std.mem.indexOf(u8, mock.body(), "\"template_id\":\"T1\"") != null);
+}
 
-    // add_template
+test "addTemplate 两个 Java 重载(1 参数 / 2 参数)+ template_id 所有权" {
+    const gpa = testing.allocator;
+    var mock = Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "api_add_template", .response = "{\"errcode\":0,\"template_id\":\"NEW_TPL\"}" },
+    } };
+    var threaded: std.Io.Threaded = undefined;
+    var cfg: config_mod.InMemoryConfigStorage = undefined;
+    var base: service_mod.Service = undefined;
+    try setup(gpa, &mock, &threaded, &cfg, &base);
+    defer threaded.deinit();
+    defer cfg.deinit();
+    var svc = TemplateMsgService{ .svc = &base };
+    const io = threaded.io();
+
+    // 重载 1:addTemplate(String) —— Java 委托 Collections.emptyList() → 空 keyword_name_list
+    switch (svc.addTemplate(io, "TPL_SHORT", null)) {
+        .ok => |tid| {
+            defer gpa.free(tid);
+            try testing.expectEqualStrings("NEW_TPL", tid);
+        },
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.Unexpected;
+        },
+    }
+    try testing.expectEqualStrings("post", mock.last_method);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "https://api.weixin.qq.com/cgi-bin/template/api_add_template") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"template_id_short\":\"TPL_SHORT\"") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"keyword_name_list\":[]") != null);
+
+    // 重载 2:addTemplate(String, List<String>) —— 关键词按序写入 keyword_name_list
     switch (svc.addTemplate(io, "TPL_SHORT", &.{ "a", "b" })) {
         .ok => |tid| {
             defer gpa.free(tid);
@@ -627,7 +707,5 @@ test "template industry / 模板列表 / 删除 / 添加" {
             return error.Unexpected;
         },
     }
-    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/template/api_add_template") != null);
-    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"template_id_short\":\"TPL_SHORT\"") != null);
     try testing.expect(std.mem.indexOf(u8, mock.body(), "\"keyword_name_list\":[\"a\",\"b\"]") != null);
 }

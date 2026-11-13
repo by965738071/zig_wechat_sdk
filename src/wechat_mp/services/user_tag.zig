@@ -1,23 +1,139 @@
-//! 标签服务 —— 对应 Java `api.WxMpUserTagService` + `api.impl.WxMpUserTagServiceImpl`。
+//! 用户标签服务 —— 逐字对齐 Java `api.WxMpUserTagService`(8 方法)+
+//! `api.impl.WxMpUserTagServiceImpl`。方法名沿用 Java 的 camelCase(rule 2),全文件一致。
 //!
-//! URL 以 Java 枚举 `enums.WxMpApiUrl.UserTag` 为准:
-//! - TAGS_CREATE  → cgi-bin/tags/create
-//! - TAGS_GET     → cgi-bin/tags/get
-//! - TAGS_UPDATE  → cgi-bin/tags/update
-//! - TAGS_DELETE  → cgi-bin/tags/delete
-//! - TAG_GET      → cgi-bin/user/tag/get(按标签取用户)
-//! - TAGS_MEMBERS_BATCHTAGGING   → cgi-bin/tags/members/batchtagging
-//! - TAGS_MEMBERS_BATCHUNTAGGING → cgi-bin/tags/members/batchuntagging
-//! - TAGS_GETIDLIST              → cgi-bin/tags/getidlist
+//! 底座(rule 3):所有 URL 路径来自 `../api_url.zig:UserTag`,经 `api()`(=
+//! `api_url.url(Host.api, path)`)拼绝对 URL;移除旧 `service.zig:ApiUrl.*` 与本地
+//! `Path` 字符串。本服务全部为「无 query 的 GET/POST」,故不涉及手工 query 组包,
+//! 无需 `mp_helpers.buildUrl`;Service.execute* 统一注入 access_token 并折叠 errcode。
+//!
+//! 与 Java impl 的对应(逐方法见各自 doc):
+//!   tagCreate → POST tags/create {"tag":{"name":..}} → WxUserTag.fromJson(取 "tag");
+//!   tagGet    → GET  tags/get → WxUserTag.listFromJson(取 "tags");
+//!   tagUpdate → POST tags/update {"tag":{"id":N,"name":..}} → errcode==0 即 true;
+//!   tagDelete → POST tags/delete {"tag":{"id":N}} → errcode==0 即 true;
+//!   tagListUser → POST user/tag/get {"tagid":N,"next_openid":trimToEmpty(..)} → WxTagListUser;
+//!   batchTagging/batchUntagging → POST {"tagid":N,"openid_list":[..]} → errcode==0 即 true;
+//!   userTagList → POST tags/getidlist {"openid":..} → 取 "tagid_list" → List<Long>。
+//!
+//! ★ Java 逻辑核对(重要):本仓库 vendored 的 `WxMpUserTagServiceImpl`(142 行,唯一一份)
+//!   **没有分片/分块循环** —— `batchTagging`/`batchUntagging` 把整个 openids 数组装进一个
+//!   JsonArray,一次 POST 完成(impl :92-108 / :111-127 无 subList/partition/limit)。因此本轮
+//!   忠实移植「单次 POST 全量」,不臆造分片。微信接口文档的单次上限(常见 50/100)由服务端
+//!   校验,SDK 此处不拦截 —— 作为集成阶段可能的增强点如实登记(见交付报告)。
+//!
+//! Java↔Zig 差异:`Boolean`/`boolean` 返回值 → `Done`(`.ok`=true、`.err`=抛出 WxError);
+//! Java 对 tagUpdate/tagDelete 再次 `WxError.fromJson(...).getErrorCode()==0` 的检查,
+//! 在 Zig 由 Service.executeInternal 统一折叠 errcode→`.err` 完成,语义等价。
+//!
+//! 内存所有权(全部 gpa 拥有):`UserTag` 用 `deinit()`;`[]UserTag`/`[]i64` 裸切片由调用方
+//! `gpa.free()`(切片元素 UserTag 需逐元素 deinit);`TagListUser` 用 `deinit()`;`.err` 用
+//! `WxError.deinit()`。
 const std = @import("std");
+const testing = std.testing;
+
 const json_util = @import("common").json_util;
 const result_mod = @import("common").result;
-const service_mod = @import("../service.zig");
-
 pub const WxResult = result_mod.WxResult;
 pub const Done = result_mod.Done;
+const WxError = result_mod.WxError;
+const u_token = @import("common").token;
 
-/// 标签 —— 对应 Java `bean.tag.WxUserTag`(id 可为 null;name 全部 gpa 拥有)。
+const api_url = @import("../api_url.zig");
+const u_config = @import("../config.zig");
+const u_http = @import("../http.zig");
+const service_mod = @import("../service.zig");
+const h = @import("sub_util.zig");
+
+// 仅复用纯 JSON 助手与离线测试脚手架(Recorder/Fixture)
+
+/// host+path 绝对 URL,路径取自 `api_url.zig:UserTag`(comptime,无分配,无需 free)。
+fn api(comptime path: []const u8) []const u8 {
+    return api_url.url(api_url.Host.api, path);
+}
+
+/// POST 且只关心 errcode:成功即完成(errcode!=0 已在 Service 折叠为 .err)。
+fn postVoid(self: *UserTagService, io: std.Io, comptime path: []const u8, body: []const u8) Done {
+    const resp = switch (self.svc.post(io, api(path), &.{}, body)) {
+        .ok => |b| b,
+        .err => |e| return .{ .err = e },
+    };
+    self.svc.gpa.free(resp);
+    return .{ .ok = {} };
+}
+
+/// 手写 JSON 转义写串(零容器生命周期风险)。
+const jw = struct {
+    fn str(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+        try std.json.Stringify.encodeJsonString(s, .{ .escape_unicode = false }, w);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 请求体组包(纯逻辑,离线可测;字段形状逐字对照 Java impl 的 JsonObject)
+// ---------------------------------------------------------------------------
+
+/// `{"tag":{ ["id":N,] ["name":..] }}` —— id/name 为 null 时省略该键。
+/// tagCreate: (null, name);tagUpdate: (id, name);tagDelete: (id, null)。
+fn tagBodyJson(gpa: std.mem.Allocator, id: ?i64, name: ?[]const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"tag\":{");
+    var first = true;
+    if (id) |n| {
+        try w.print("\"id\":{d}", .{n});
+        first = false;
+    }
+    if (name) |s| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"name\":");
+        try jw.str(w, s);
+    }
+    try w.writeAll("}}");
+    return out.toOwnedSlice();
+}
+
+/// `{"tagid":N,"next_openid":..}` —— Java `StringUtils.trimToEmpty(nextOpenid)`。
+fn tagListUserBody(gpa: std.mem.Allocator, tag_id: i64, next_openid: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("{{\"tagid\":{d},\"next_openid\":", .{tag_id});
+    try jw.str(w, std.mem.trim(u8, next_openid, " \t\r\n"));
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+/// `{"tagid":N,"openid_list":[..]}` —— Java batchTagging/batchUntagging 的 OpenidArrayJson。
+fn batchBody(gpa: std.mem.Allocator, tag_id: i64, openids: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("{{\"tagid\":{d},\"openid_list\":[", .{tag_id});
+    for (openids, 0..) |o, i| {
+        if (i != 0) try w.writeByte(',');
+        try jw.str(w, o);
+    }
+    try w.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+/// `{"openid":..}` —— Java userTagList 的 JsonObject。
+fn userTagListBody(gpa: std.mem.Allocator, openid: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"openid\":");
+    try jw.str(w, openid);
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
+// 结果结构(全部 gpa 拥有,用毕 deinit)
+// ---------------------------------------------------------------------------
+
+/// 标签 —— 对应 Java `bean.tag.WxUserTag`(id/count 可为 null;name gpa 拥有)。
 pub const UserTag = struct {
     gpa: std.mem.Allocator,
     id: ?i64 = null,
@@ -59,16 +175,12 @@ pub const TagListUser = struct {
         r.next_openid = try gpa.dupe(u8, json_util.getStrOr(v, "next_openid", ""));
 
         var list: std.ArrayList([]u8) = .empty;
-        errdefer for (list.items) |o| gpa.free(o);
-        if (json_util.objectOf(v, "data")) |_| {
-            // data.openid 是字符串数组
-            const data = blk: {
-                const o = json_util.object(v) orelse break :blk null;
-                const c = o.get("data") orelse break :blk null;
-                break :blk json_util.object(c);
-            };
-            if (data) |d| {
-                const oi = d.get("openid") orelse return r;
+        errdefer {
+            for (list.items) |o| gpa.free(o);
+            list.deinit(gpa);
+        }
+        if (json_util.objectOf(v, "data")) |d| {
+            if (d.get("openid")) |oi| {
                 if (oi == .array) for (oi.array.items) |s| {
                     if (s == .string) try list.append(gpa, try gpa.dupe(u8, s.string));
                 };
@@ -79,84 +191,51 @@ pub const TagListUser = struct {
     }
 };
 
-/// 拼 api.weixin.qq.com 前缀(uri 交给调用方 free;与 template_msg.zig 同一样板)。
-fn apiUri(gpa: std.mem.Allocator, path: []const u8) WxResult([]u8) {
-    return .{ .ok = std.fmt.allocPrint(gpa, "{s}{s}", .{ service_mod.api_host_url, path }) catch
-        return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) } };
-}
-
-fn apiGet(svc: *service_mod.Service, io: std.Io, path: []const u8) WxResult([]u8) {
-    const uri = switch (apiUri(svc.gpa, path)) {
-        .ok => |u| u,
-        .err => |e| return .{ .err = e },
-    };
-    defer svc.gpa.free(uri);
-    return svc.get(io, uri, &.{});
-}
-
-fn apiPost(svc: *service_mod.Service, io: std.Io, path: []const u8, body: []const u8) WxResult([]u8) {
-    const uri = switch (apiUri(svc.gpa, path)) {
-        .ok => |u| u,
-        .err => |e| return .{ .err = e },
-    };
-    defer svc.gpa.free(uri);
-    return svc.post(io, uri, &.{}, body);
-}
-
-/// POST 且只关心 errcode:成功即完成(errcode!=0 已在 Service 折叠为 .err)。
-fn postVoid(svc: *service_mod.Service, io: std.Io, path: []const u8, body: []const u8) Done {
-    const resp = switch (apiPost(svc, io, path, body)) {
-        .ok => |b| b,
-        .err => |e| return .{ .err = e },
-    };
-    svc.gpa.free(resp);
-    return .{ .ok = {} };
-}
-
-/// 手写 JSON 转义写串(与 template_msg.toJson 同法,零容器生命周期风险)。
-const jw = struct {
-    fn str(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-        try std.json.Stringify.encodeJsonString(s, .{ .escape_unicode = false }, w);
-    }
-};
-
-/// `{"tag":{"id":N,"name":"..."}}`(id<0 表示不带 id 字段)。
-fn tagBodyJson(gpa: std.mem.Allocator, id: i64, name: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    const w = &out.writer;
-    try w.writeAll("{\"tag\":{");
-    if (id >= 0) try w.print("\"id\":{d},", .{id});
-    try w.writeAll("\"name\":");
-    try jw.str(w, name);
-    try w.writeAll("}}");
-    return out.toOwnedSlice();
-}
+// ---------------------------------------------------------------------------
+// UserTagService —— 对应 Java `WxMpUserTagService`(8 方法) + `WxMpUserTagServiceImpl`
+// ---------------------------------------------------------------------------
 
 pub const UserTagService = struct {
     svc: *service_mod.Service,
 
-    /// 对应 `tagCreate(name)`:POST cgi-bin/tags/create {"tag":{"name":...}}
-    /// → {"tag":{"id":..,"name":..}}。
+    /// `WxMpUserTagService.tagCreate(name)` (接口 :46 / impl :32-40)。
+    /// POST cgi-bin/tags/create {"tag":{"name":..}} → 解析响应 "tag" → WxUserTag.fromJson。
     pub fn tagCreate(self: *UserTagService, io: std.Io, name: []const u8) WxResult(UserTag) {
         const gpa = self.svc.gpa;
-        const body = tagBodyJson(gpa, -1, name) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        const body = tagBodyJson(gpa, null, name) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-        return self.tagFromResp(io, "cgi-bin/tags/create", body);
-    }
-
-    /// 对应 `tagGet()`:GET cgi-bin/tags/get → {"tags":[{id,name},...]}。
-    /// 所有权:切片逐元素 deinit;`len != 0` 时由调用方 `free` 切片本身。
-    pub fn tagGet(self: *UserTagService, io: std.Io) WxResult([]UserTag) {
-        const gpa = self.svc.gpa;
-        const resp = switch (apiGet(self.svc, io, "cgi-bin/tags/get")) {
+        const resp = switch (self.svc.post(io, api(api_url.UserTag.tags_create), &.{}, body)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
         defer gpa.free(resp);
         const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "tags/get not json", .{}),
+            .err = WxError.transport(gpa, "tags not json", .{}),
+        };
+        defer parsed.deinit();
+        const tag_v = if (json_util.objectOf(parsed.value, "tag")) |_| blk: {
+            const o = json_util.object(parsed.value) orelse break :blk json_util.Value{ .null = {} };
+            break :blk o.get("tag").?;
+        } else json_util.Value{ .null = {} };
+        const t = UserTag.fromJson(gpa, tag_v) catch return .{
+            .err = WxError.transport(gpa, "tags parse failed", .{}),
+        };
+        return .{ .ok = t };
+    }
+
+    /// `WxMpUserTagService.tagGet()` (接口 :68 / impl :43-46)。
+    /// GET cgi-bin/tags/get(无 query)→ 解析 "tags" → WxUserTag.listFromJson。
+    /// 所有权:[]UserTag 由调用方 free;每个元素用 deinit()。
+    pub fn tagGet(self: *UserTagService, io: std.Io) WxResult([]UserTag) {
+        const gpa = self.svc.gpa;
+        const resp = switch (self.svc.get(io, api(api_url.UserTag.tags_get), &.{})) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch return .{
+            .err = WxError.transport(gpa, "tags/get not json", .{}),
         };
         defer parsed.deinit();
 
@@ -168,84 +247,91 @@ pub const UserTagService = struct {
         if (json_util.getArray(parsed.value, "tags")) |arr| {
             for (arr.items) |item| {
                 const tag = UserTag.fromJson(gpa, item) catch
-                    return .{ .err = result_mod.WxError.transport(gpa, "tags item parse failed", .{}) };
+                    return .{ .err = WxError.transport(gpa, "tags item parse failed", .{}) };
                 list.append(gpa, tag) catch
-                    return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+                    return .{ .err = WxError.internal(gpa, "oom", .{}) };
             }
         }
         return .{ .ok = list.toOwnedSlice(gpa) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) } };
+            return .{ .err = WxError.internal(gpa, "oom", .{}) } };
     }
 
-    /// 对应 `tagUpdate(tagId, name)`:POST cgi-bin/tags/update,成功即 errcode==0。
+    /// `WxMpUserTagService.tagUpdate(tagId, name)` (接口 :93 / impl :49-63)。
+    /// POST cgi-bin/tags/update {"tag":{"id":N,"name":..}};errcode==0 即 true。
     pub fn tagUpdate(self: *UserTagService, io: std.Io, tag_id: i64, name: []const u8) Done {
         const gpa = self.svc.gpa;
         const body = tagBodyJson(gpa, tag_id, name) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-        return postVoid(self.svc, io, "cgi-bin/tags/update", body);
+        return postVoid(self, io, api_url.UserTag.tags_update, body);
     }
 
-    /// 对应 `tagDelete(tagId)`:POST cgi-bin/tags/delete {"tag":{"id":N}}。
+    /// `WxMpUserTagService.tagDelete(tagId)` (接口 :117 / impl :66-79)。
+    /// POST cgi-bin/tags/delete {"tag":{"id":N}}(Java 不带 name);errcode==0 即 true。
     pub fn tagDelete(self: *UserTagService, io: std.Io, tag_id: i64) Done {
         const gpa = self.svc.gpa;
-        const body = tagBodyJson(gpa, tag_id, "") catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        const body = tagBodyJson(gpa, tag_id, null) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-        return postVoid(self.svc, io, "cgi-bin/tags/delete", body);
+        return postVoid(self, io, api_url.UserTag.tags_delete, body);
     }
 
-    /// 对应 `tagListUser(tagId, nextOpenid)`:POST cgi-bin/user/tag/get
-    /// {"tagid":N,"next_openid":..}(Java 用 trimToEmpty → 空串必填)。
+    /// `WxMpUserTagService.tagListUser(tagId, nextOpenid)` (接口 :142 / impl :82-89)。
+    /// POST cgi-bin/user/tag/get {"tagid":N,"next_openid":trimToEmpty(..)} → WxTagListUser。
     pub fn tagListUser(self: *UserTagService, io: std.Io, tag_id: i64, next_openid: []const u8) WxResult(TagListUser) {
         const gpa = self.svc.gpa;
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        errdefer out.deinit();
-        const w = &out.writer;
-        w.print("{{\"tagid\":{d},\"next_openid\":", .{tag_id}) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        jw.str(w, next_openid) catch return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        w.writeByte('}') catch return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        const body = out.toOwnedSlice() catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        const body = tagListUserBody(gpa, tag_id, next_openid) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(body);
-
-        return self.tagListFromResp(io, "cgi-bin/user/tag/get", body);
-    }
-
-    /// 对应 `batchTagging(tagId, openids)`:POST tags/members/batchtagging。
-    pub fn batchTagging(self: *UserTagService, io: std.Io, tag_id: i64, openids: []const []const u8) Done {
-        return self.batchBody(io, "cgi-bin/tags/members/batchtagging", tag_id, openids);
-    }
-
-    /// 对应 `batchUntagging(tagId, openids)`:POST tags/members/batchuntagging。
-    pub fn batchUntagging(self: *UserTagService, io: std.Io, tag_id: i64, openids: []const []const u8) Done {
-        return self.batchBody(io, "cgi-bin/tags/members/batchuntagging", tag_id, openids);
-    }
-
-    /// 对应 `userTagList(openid)`:POST tags/getidlist {"openid":..}
-    /// → {"tagid_list":[1,2,..]}。
-    /// 所有权:切片由 gpa 分配,调用方 free。
-    pub fn userTagList(self: *UserTagService, io: std.Io, openid: []const u8) WxResult([]i64) {
-        const gpa = self.svc.gpa;
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        errdefer out.deinit();
-        const w = &out.writer;
-        w.writeAll("{\"openid\":") catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        jw.str(w, openid) catch return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        w.writeByte('}') catch return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        const body = out.toOwnedSlice() catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        defer gpa.free(body);
-
-        const resp = switch (apiPost(self.svc, io, "cgi-bin/tags/getidlist", body)) {
+        const resp = switch (self.svc.post(io, api(api_url.UserTag.tag_get), &.{}, body)) {
             .ok => |b| b,
             .err => |e| return .{ .err = e },
         };
         defer gpa.free(resp);
         const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "tags/getidlist not json", .{}),
+            .err = WxError.transport(gpa, "user/tag/get not json", .{}),
+        };
+        defer parsed.deinit();
+        const r = TagListUser.fromJson(gpa, parsed.value) catch return .{
+            .err = WxError.transport(gpa, "user/tag/get parse failed", .{}),
+        };
+        return .{ .ok = r };
+    }
+
+    /// `WxMpUserTagService.batchTagging(tagId, openids)` (接口 :167 / impl :92-108)。
+    /// POST cgi-bin/tags/members/batchtagging {"tagid":N,"openid_list":[..]}(单次全量,不分片)。
+    pub fn batchTagging(self: *UserTagService, io: std.Io, tag_id: i64, openids: []const []const u8) Done {
+        const gpa = self.svc.gpa;
+        const body = batchBody(gpa, tag_id, openids) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        defer gpa.free(body);
+        return postVoid(self, io, api_url.UserTag.tags_members_batchtagging, body);
+    }
+
+    /// `WxMpUserTagService.batchUntagging(tagId, openids)` (接口 :192 / impl :111-127)。
+    /// POST cgi-bin/tags/members/batchuntagging {"tagid":N,"openid_list":[..]}(单次全量,不分片)。
+    pub fn batchUntagging(self: *UserTagService, io: std.Io, tag_id: i64, openids: []const []const u8) Done {
+        const gpa = self.svc.gpa;
+        const body = batchBody(gpa, tag_id, openids) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        defer gpa.free(body);
+        return postVoid(self, io, api_url.UserTag.tags_members_batchuntagging, body);
+    }
+
+    /// `WxMpUserTagService.userTagList(openid)` (接口 :216 / impl :130-140)。
+    /// POST cgi-bin/tags/getidlist {"openid":..} → 取 "tagid_list" → List<Long>(gpa 拥有,调用方 free)。
+    pub fn userTagList(self: *UserTagService, io: std.Io, openid: []const u8) WxResult([]i64) {
+        const gpa = self.svc.gpa;
+        const body = userTagListBody(gpa, openid) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        defer gpa.free(body);
+        const resp = switch (self.svc.post(io, api(api_url.UserTag.tags_getidlist), &.{}, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch return .{
+            .err = WxError.transport(gpa, "tags/getidlist not json", .{}),
         };
         defer parsed.deinit();
 
@@ -254,90 +340,26 @@ pub const UserTagService = struct {
         if (json_util.getArray(parsed.value, "tagid_list")) |arr| {
             for (arr.items) |item| switch (item) {
                 .integer => |n| list.append(gpa, n) catch
-                    return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) },
+                    return .{ .err = WxError.internal(gpa, "oom", .{}) },
                 else => {},
             };
         }
         return .{ .ok = list.toOwnedSlice(gpa) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) } };
-    }
-
-    // ---- 内部 ----
-
-    fn tagFromResp(self: *UserTagService, io: std.Io, path: []const u8, body: []const u8) WxResult(UserTag) {
-        const gpa = self.svc.gpa;
-        const resp = switch (apiPost(self.svc, io, path, body)) {
-            .ok => |b| b,
-            .err => |e| return .{ .err = e },
-        };
-        defer gpa.free(resp);
-        const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "tags not json", .{}),
-        };
-        defer parsed.deinit();
-        const tag_v = if (json_util.objectOf(parsed.value, "tag")) |_| blk: {
-            const o = json_util.object(parsed.value) orelse break :blk json_util.Value{ .null = {} };
-            break :blk o.get("tag").?;
-        } else json_util.Value{ .null = {} };
-        const t = UserTag.fromJson(gpa, tag_v) catch return .{
-            .err = result_mod.WxError.transport(gpa, "tags parse failed", .{}),
-        };
-        return .{ .ok = t };
-    }
-
-    fn tagListFromResp(self: *UserTagService, io: std.Io, path: []const u8, body: []const u8) WxResult(TagListUser) {
-        const gpa = self.svc.gpa;
-        const resp = switch (apiPost(self.svc, io, path, body)) {
-            .ok => |b| b,
-            .err => |e| return .{ .err = e },
-        };
-        defer gpa.free(resp);
-        const parsed = json_util.parse(gpa, resp) catch return .{
-            .err = result_mod.WxError.transport(gpa, "user/tag/get not json", .{}),
-        };
-        defer parsed.deinit();
-        const r = TagListUser.fromJson(gpa, parsed.value) catch return .{
-            .err = result_mod.WxError.transport(gpa, "user/tag/get parse failed", .{}),
-        };
-        return .{ .ok = r };
-    }
-
-    fn batchBody(self: *UserTagService, io: std.Io, path: []const u8, tag_id: i64, openids: []const []const u8) Done {
-        const gpa = self.svc.gpa;
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        errdefer out.deinit();
-        const w = &out.writer;
-        w.print("{{\"tagid\":{d},\"openid_list\":[", .{tag_id}) catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        for (openids, 0..) |o, i| {
-            if (i != 0) w.writeByte(',') catch return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-            jw.str(w, o) catch return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        }
-        w.writeAll("]}") catch return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        const body = out.toOwnedSlice() catch
-            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
-        defer gpa.free(body);
-        return postVoid(self.svc, io, path, body);
+            return .{ .err = WxError.internal(gpa, "oom", .{}) } };
     }
 };
 
 // ---------------------------------------------------------------------------
-// 测试:复用 user.zig 的 stub 样板。
+// 离线契约测试
 // ---------------------------------------------------------------------------
 
-const testing = std.testing;
-const http_mod = @import("../http.zig");
-const config_mod = @import("../config.zig");
-const token_mod = @import("common").token;
-const error_mod = @import("common").error_util;
-
-test "user_tag service: create/get/update/delete/batch/idlist" {
+test "user_tag service: create/get/update/delete/batch/idlist(StubExecutor 端到端)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    var stub = http_mod.StubExecutor.init(gpa, &.{
+    var stub = u_http.StubExecutor.init(gpa, &.{
         .{ .match = "cgi-bin/tags/create", .response = "{\"tag\":{\"id\":102,\"name\":\"标签\"}}" },
         .{ .match = "cgi-bin/tags/getidlist", .response = "{\"tagid_list\":[1,2,3]}" },
         .{ .match = "cgi-bin/tags/get", .response = "{\"tags\":[{\"id\":1,\"name\":\"A\",\"count\":7},{\"id\":2,\"name\":\"B\"}]}" },
@@ -349,20 +371,19 @@ test "user_tag service: create/get/update/delete/batch/idlist" {
     });
 
     const FakeFetch = struct {
-        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) token_mod.FetchOutcome {
+        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) u_token.FetchOutcome {
             _ = c;
             _ = i;
-            const t = g.dupe(u8, "TOK") catch return .{ .err = error_mod.WxError.transport(g, "oom", .{}) };
+            const t = g.dupe(u8, "TOK") catch return .{ .err = WxError.transport(g, "oom", .{}) };
             return .{ .ok = .{ .token = t, .expires_in = 7200 } };
         }
     };
-    var cfg = try config_mod.InMemoryConfigStorage.init(gpa, .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } }, .{ .appid = "A", .secret = "S" });
+    var cfg = try u_config.InMemoryConfigStorage.init(gpa, .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } }, .{ .appid = "A", .secret = "S" });
     defer cfg.deinit();
 
     var svc = service_mod.Service.init(gpa, cfg.config(), stub.executor());
     var tags = UserTagService{ .svc = &svc };
 
-    // tagCreate
     {
         switch (tags.tagCreate(io, "标签")) {
             .ok => |*t| {
@@ -374,8 +395,6 @@ test "user_tag service: create/get/update/delete/batch/idlist" {
             .err => return error.Unexpected,
         }
     }
-
-    // tagGet
     {
         switch (tags.tagGet(io)) {
             .ok => |list| {
@@ -392,8 +411,6 @@ test "user_tag service: create/get/update/delete/batch/idlist" {
             .err => return error.Unexpected,
         }
     }
-
-    // tagUpdate / tagDelete(POST errcode==0 语义)
     switch (tags.tagUpdate(io, 102, "改名")) {
         .ok => {},
         .err => return error.Unexpected,
@@ -402,8 +419,6 @@ test "user_tag service: create/get/update/delete/batch/idlist" {
         .ok => {},
         .err => return error.Unexpected,
     }
-
-    // tagListUser
     switch (tags.tagListUser(io, 102, "oX")) {
         .ok => |*t| {
             var r = t.*;
@@ -414,8 +429,6 @@ test "user_tag service: create/get/update/delete/batch/idlist" {
         },
         .err => return error.Unexpected,
     }
-
-    // batchTagging 成功 / batchUntagging 直接抛错
     switch (tags.batchTagging(io, 102, &.{ "o1", "o2" })) {
         .ok => {},
         .err => return error.Unexpected,
@@ -428,8 +441,6 @@ test "user_tag service: create/get/update/delete/batch/idlist" {
             try testing.expectEqual(@as(i64, 45051), err.error_code);
         },
     }
-
-    // userTagList
     switch (tags.userTagList(io, "oX")) {
         .ok => |list| {
             defer gpa.free(list);
@@ -438,4 +449,107 @@ test "user_tag service: create/get/update/delete/batch/idlist" {
         },
         .err => return error.Unexpected,
     }
+}
+
+// 请求体逐字对齐 Java impl(JsonObject 字段顺序/缺省键)。复用 sub_util.Recorder。
+test "user_tag 请求体契约: create/update/delete/listUser/batch/getidlist" {
+    const gpa = testing.allocator;
+    var mock = h.Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "cgi-bin/tags/create", .response = "{\"tag\":{\"id\":1,\"name\":\"n\"}}" },
+        .{ .match = "cgi-bin/tags/update", .response = "{\"errcode\":0}" },
+        .{ .match = "cgi-bin/tags/delete", .response = "{\"errcode\":0}" },
+        .{ .match = "cgi-bin/user/tag/get", .response = "{\"count\":0,\"data\":{\"openid\":[]},\"next_openid\":\"\"}" },
+        .{ .match = "batchtagging", .response = "{\"errcode\":0}" },
+        .{ .match = "batchuntagging", .response = "{\"errcode\":0}" },
+        .{ .match = "cgi-bin/tags/getidlist", .response = "{\"tagid_list\":[]}" },
+    } };
+    var fx: h.Fixture = undefined;
+    try h.setup(gpa, &mock, &fx);
+    defer h.teardown(&fx);
+    var svc = UserTagService{ .svc = &fx.svc };
+    const io = fx.threaded.io();
+
+    // tagCreate: {"tag":{"name":..}} —— 不带 id
+    switch (svc.tagCreate(io, "n")) {
+        .ok => |*t| {
+            var tag = t.*;
+            defer tag.deinit();
+        },
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "{\"tag\":{\"name\":\"n\"}}") != null);
+
+    // tagUpdate: {"tag":{"id":102,"name":..}} —— id 在前
+    switch (svc.tagUpdate(io, 102, "改名")) {
+        .ok => {},
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "{\"tag\":{\"id\":102,\"name\":\"改名\"}}") != null);
+
+    // tagDelete: {"tag":{"id":102}} —— 不带 name(Java impl 只 addProperty("id"))
+    switch (svc.tagDelete(io, 102)) {
+        .ok => {},
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "name") == null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "{\"tag\":{\"id\":102}}") != null);
+
+    // tagListUser: next_openid 经 trimToEmpty(首尾空白)
+    switch (svc.tagListUser(io, 102, "  oX  ")) {
+        .ok => |*r| {
+            var t = r.*;
+            defer t.deinit();
+        },
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "{\"tagid\":102,\"next_openid\":\"oX\"}") != null);
+
+    // batchTagging / batchUntagging: {"tagid":N,"openid_list":[..]}
+    const ids = [_][]const u8{ "o1", "o2" };
+    switch (svc.batchTagging(io, 102, &ids)) {
+        .ok => {},
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "{\"tagid\":102,\"openid_list\":[\"o1\",\"o2\"]}") != null);
+    switch (svc.batchUntagging(io, 102, &ids)) {
+        .ok => {},
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "batchuntagging") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"openid_list\":[\"o1\",\"o2\"]") != null);
+
+    // userTagList: {"openid":..}
+    switch (svc.userTagList(io, "oX")) {
+        .ok => |list| gpa.free(list),
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "{\"openid\":\"oX\"}") != null);
+}
+
+// 核对 Java impl 无分片:大数组仍**单次 POST 全量**(不臆造 subList/partition 循环)。
+test "user_tag batchTagging 不分片: 120 个 openid 一次 POST 全量" {
+    const gpa = testing.allocator;
+    var mock = h.Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "batchtagging", .response = "{\"errcode\":0,\"errmsg\":\"ok\"}" },
+    } };
+    var fx: h.Fixture = undefined;
+    try h.setup(gpa, &mock, &fx);
+    defer h.teardown(&fx);
+    var svc = UserTagService{ .svc = &fx.svc };
+
+    var ids_buf: [120][]const u8 = undefined;
+    for (&ids_buf, 0..) |*s, i| s.* = try std.fmt.allocPrint(gpa, "oid{d}", .{i});
+    defer for (ids_buf) |s| gpa.free(s);
+
+    switch (svc.batchTagging(fx.threaded.io(), 7, &ids_buf)) {
+        .ok => {},
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.Unexpected;
+        },
+    }
+    try testing.expectEqual(@as(usize, 1), mock.calls); // 单次 POST,无分片
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "oid0") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "oid119") != null); // 末尾也在同一 body
 }

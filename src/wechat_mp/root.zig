@@ -9,6 +9,7 @@ pub const router = @import("router.zig");
 pub const service = @import("service.zig");
 pub const services_a = @import("services/root_a.zig");
 pub const services_b = @import("services/root_b.zig");
+pub const api_url = @import("api_url.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -21,4 +22,5 @@ test {
     _ = mp;
     _ = services_a;
     _ = services_b;
+    _ = api_url;
 }

@@ -12,18 +12,21 @@
 //! 子服务(UserService 等)组合在本结构之上,不继承 —— 与 Java 的
 //! 「子服务持 parent 引用」组合方式一致。
 const std = @import("std");
-const error_mod = @import("common").error_util;
-const result_mod = @import("common").result;
-const consts = @import("common").consts;
-const json_util = @import("common").json_util;
-const sha1 = @import("common").crypt.sha1;
-const random_mod = @import("common").random;
-const config_mod = @import("config.zig");
-const http_mod = @import("http.zig");
+const testing = std.testing;
 
+const consts = @import("common").consts;
+const error_mod = @import("common").error_util;
 pub const WxError = error_mod.WxError;
+const json_util = @import("common").json_util;
+const random_mod = @import("common").random;
+const result_mod = @import("common").result;
 pub const WxResult = result_mod.WxResult;
+const sha1 = @import("common").crypt.sha1;
+const token_mod = @import("common").token;
+
+const config_mod = @import("config.zig");
 pub const ConfigStorage = config_mod.ConfigStorage;
+const http_mod = @import("http.zig");
 pub const RequestExecutor = http_mod.RequestExecutor;
 
 /// 对应 Java `api.impl.WxMpServiceImpls`/枚举 `ApiUrl`(骨架收录代表性接口)。
@@ -282,12 +285,12 @@ pub fn urlEncode(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
             ' ' => try out.append(gpa, '+'),
             else => {
                 var esc: [3]u8 = undefined;
-                const part = std.fmt.bufPrint(&esc, "%{X:0>2}", .{c}) catch unreachable;
+                const part = try std.fmt.bufPrint(&esc, "%{X:0>2}", .{c});
                 try out.appendSlice(gpa, part);
             },
         }
     }
-    return out.toOwnedSlice(gpa); // 0.18-dev:ArrayList.toOwnedSlice 需传 allocator
+    return try out.toOwnedSlice(gpa); // 0.18-dev:ArrayList.toOwnedSlice 需传 allocator
 }
 
 /// base?k1=v1&k2=v2(&access_token=...)
@@ -302,14 +305,16 @@ fn buildUrl(gpa: std.mem.Allocator, base: []const u8, query: []const Query, acce
         const part = try std.fmt.allocPrint(gpa, "{c}{s}={s}", .{ sep, q.key, v });
         defer gpa.free(part);
         try out.appendSlice(gpa, part);
-        sep = '&';
+        if(sep == '?') {
+             sep = '&';
+        }
     }
     if (access_token) |t| {
         const part = try std.fmt.allocPrint(gpa, "{c}access_token={s}", .{ sep, t });
         defer gpa.free(part);
         try out.appendSlice(gpa, part);
     }
-    return out.toOwnedSlice(gpa);
+    return try out.toOwnedSlice(gpa);
 }
 
 /// 对应 `BaseWxMpServiceImpl`。
@@ -727,9 +732,6 @@ pub const Service = struct {
 // ---------------------------------------------------------------------------
 // 测试:URL-only 端点 + JSSDK 签名(离线,记录型 executor)
 // ---------------------------------------------------------------------------
-
-const testing = std.testing;
-const token_mod = @import("common").token;
 
 /// 记录型 executor:捕获 method/uri/body,按 uri 子串返回预置响应。
 const SvcRecorder = struct {

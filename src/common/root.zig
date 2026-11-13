@@ -17,6 +17,7 @@ pub const duplicate = @import("duplicate.zig");
 pub const session = @import("session.zig");
 pub const redis_ops = @import("redis_ops.zig");
 pub const credentials = @import("credentials.zig");
+pub const mp_helpers = @import("mp_helpers.zig");
 
 /// 加密与签名族（对应 Java `me.chanjar.weixin.common.util.crypto/sign` 包）。
 pub const crypt = struct {
@@ -38,4 +39,5 @@ test {
     _ = @import("crypt/sign.zig");
     _ = @import("crypt/pkcs7.zig");
     _ = @import("credentials.zig");
+    _ = @import("mp_helpers.zig");
 }
