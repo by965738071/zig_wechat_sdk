@@ -37,20 +37,59 @@
 //!                     {"card_id","is_open","need_verify_cod","need_remark_amount"} → void
 //!   getUserCardList   CARD_USER_CARD_LIST   /card/user/getcardlist
 //!                     {"openid","card_id"} → WxUserCardListResult(原样返回;bean 字段 @SerializedName("card_list")/"has_share_card")
+//!   getCardApiTicket  CARD_GET_TICKET      /cgi-bin/ticket/getticket?type=wx_card
+//!                     (GET,SimpleGetRequestExecutor)→ ticket
+//!   createCardApiSignature         (无端点;本地计算)
+//!                     signParams = optional ++ [timestamp,nonceStr,cardApiTicket]
+//!                     → Arrays.sort → **无分隔符拼接** → SHA1 小写 hex
+//!                     → WxCardApiSignature{timestamp,nonceStr,signature}
+//!   createQrcodeCard  CARD_QRCODE_CREATE   /card/qrcode/create
+//!                     {"action_name":"QR_CARD","expire_seconds"?(>0 才发),
+//!                      "action_info":{"card":{"openid"?,"code"?,
+//!                      "is_unique_code","card_id","outer_str"}}}
+//!                     → WxMpCardQrcodeCreateResult(ticket/expire_seconds/url/show_qrcode_url)
+//!                     (Java 3 个重载 → QrcodeOptions 默认值表达)
+//!   createLandingPage CARD_LANDING_PAGE_CREATE /card/landingpage/create
+//!                     {"banner","page_title","can_share","scene","card_list":<数组>}
+//!                     → WxMpCardLandingPageCreateResult(url/page_id)
 //!
-//! 未收录(下一轮):createQrcodeCard/createLandingPage/createCard 等 body 为复杂 bean/
-//! 多层嵌套对象的端点;getCardApiTicket + createCardApiSignature 依赖真实 api ticket
-//! (GET /cgi-bin/ticket/getticket)与 SHA1 签名,归入「含真实凭证依赖、不可离线测」,不伪造。
-//! 返回 WxResult([]u8) 的端点与 Java 返回 String 的方法同口径:原样返回响应 body。
+//! Java↔Zig 差异:
+//!   - getCardApiTicket:Java 按 TicketType.WX_CARD 槽缓存(expireTicket/
+//!     isTicketExpired/updateTicket + 锁);Zig 侧 config 仅 jsapi ticket 槽,
+//!     本版每次现取不缓存,`force_refresh` 参数保留但不生效
+//!     (Java forceRefresh=false 时若缓存未过期也走缓存,不现取——语义差异见上);
+//!   - createLandingPage 的 card_list:Java JsonArray → 原始 JSON 数组文本
+//!     `card_list_json`(调用方拼接,原样内嵌,不做转义);
+//!   - createCard/createCardSeries 等请求体为大型复杂 bean(WxMpCardCreateRequest
+//!     全字段嵌套)仍未收录,后续按需补。返回 WxResult([]u8) 的端点与 Java 返回
+//!     String 的方法同口径:原样返回响应 body。
 const std = @import("std");
 const testing = std.testing;
 const json_util = @import("common").json_util;
 const result_mod = @import("common").result;
 const service_mod = @import("../service.zig");
+const api_url = @import("../api_url.zig");
+const sha1 = @import("common").crypt.sha1;
+const random_mod = @import("common").random;
 const h = @import("sub_util.zig");
 
 pub const WxResult = result_mod.WxResult;
 pub const Done = result_mod.Done;
+
+fn oom(gpa: std.mem.Allocator) result_mod.WxError {
+    return result_mod.WxError.internal(gpa, "oom", .{});
+}
+
+fn strOf(gpa: std.mem.Allocator, v: json_util.Value, key: []const u8) ![]u8 {
+    return gpa.dupe(u8, json_util.getStrOr(v, key, ""));
+}
+
+/// card_list 原样内嵌的手写 JSON 转义写串(与 `datacube.zig` 的 jw 同法)。
+const jw = struct {
+    fn str(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+        try std.json.Stringify.encodeJsonString(s, .{ .escape_unicode = false }, w);
+    }
+};
 
 pub const CardService = struct {
     svc: *service_mod.Service,
@@ -219,7 +258,246 @@ pub const CardService = struct {
     pub fn getUserCardList(self: *CardService, io: std.Io, openid: []const u8, card_id: []const u8) WxResult([]u8) {
         return self.post(io, .card_user_card_list, .{ .openid = openid, .card_id = card_id });
     }
+
+    // -----------------------------------------------------------------------
+    // api ticket + 签名(WxMpCardServiceImpl:22-67)
+    // -----------------------------------------------------------------------
+
+    /// 对应 `#getCardApiTicket(boolean)`(impl:31-61):GET CARD_GET_TICKET
+    /// (SimpleGetRequestExecutor)→ ticket/expires_in。`force_refresh` 保留
+    /// 但不生效:Zig config 仅 jsapi ticket 槽,本版每次现取(见头注释)。
+    pub fn getCardApiTicket(self: *CardService, io: std.Io, force_refresh: bool) WxResult([]u8) {
+        _ = force_refresh;
+        const resp = switch (h.apiGet(self.svc, io, api_url.Card.card_get_ticket)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer self.svc.gpa.free(resp);
+        // Java `tmpJsonObject.get("ticket").getAsString()` → h.strField
+        return h.strField(self.svc.gpa, resp, "ticket");
+    }
+
+    /// 对应 Java bean `WxCardApiSignature` 的对外三字段
+    /// (appId/cardId/cardType/locationId/code/openId 是调用方可选入参,不回传)。
+    pub const ApiSignature = struct {
+        gpa: std.mem.Allocator,
+        timestamp: i64,
+        nonce_str: []u8,
+        signature: []u8,
+
+        pub fn deinit(self: *ApiSignature) void {
+            self.gpa.free(self.nonce_str);
+            self.gpa.free(self.signature);
+            self.* = undefined;
+        }
+    };
+
+    /// 注入量(测试确定性):对应 Java 的 RandomUtils.getRandomStr() 与
+    /// System.currentTimeMillis()/1000(生产传 null)。
+    pub const Inject = struct { nonce_str: []const u8, timestamp: i64 };
+
+    /// 对应 `#createCardApiSignature(String...)`(impl:63-89):
+    /// signParams = optional ++ [timestamp, nonceStr, cardApiTicket] →
+    /// Arrays.sort → **无分隔符拼接** → SHA1 小写 hex
+    /// (`common.sha1.gen` 即排序+无分隔拼接+小写 hex,同构)。
+    pub fn createCardApiSignature(self: *CardService, io: std.Io, optional_params: []const []const u8, inject: ?Inject) WxResult(ApiSignature) {
+        const gpa = self.svc.gpa;
+        const ticket = switch (self.getCardApiTicket(io, false)) {
+            .ok => |t| t,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(ticket);
+
+        var nonce_buf: [16]u8 = undefined;
+        var ts: i64 = undefined;
+        var nonce: []const u8 = undefined;
+        if (inject) |inj| {
+            nonce = inj.nonce_str;
+            ts = inj.timestamp;
+        } else {
+            random_mod.randomStr(io, &nonce_buf) catch |e|
+                return .{ .err = result_mod.WxError.transport(gpa, "nonce: {s}", .{@errorName(e)}) };
+            nonce = &nonce_buf;
+            ts = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+        }
+        var ts_buf: [20]u8 = undefined;
+        const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{ts}) catch unreachable;
+
+        const parts = gpa.alloc([]const u8, optional_params.len + 3) catch
+            return .{ .err = oom(gpa) };
+        defer gpa.free(parts);
+        @memcpy(parts[0..optional_params.len], optional_params);
+        parts[optional_params.len] = ts_str;
+        parts[optional_params.len + 1] = nonce;
+        parts[optional_params.len + 2] = ticket;
+        const signature = sha1.gen(gpa, parts) catch
+            return .{ .err = oom(gpa) };
+        errdefer gpa.free(signature);
+
+        const nonce_copy = gpa.dupe(u8, nonce) catch
+            return .{ .err = oom(gpa) };
+        return .{ .ok = .{ .gpa = gpa, .timestamp = ts, .nonce_str = nonce_copy, .signature = signature } };
+    }
+
+    // -----------------------------------------------------------------------
+    // 复杂嵌套端点(WxMpCardServiceImpl:169-238)
+    // -----------------------------------------------------------------------
+
+    /// 对应 Java `WxMpCardQrcodeCreateResult`(ticket/expire_seconds/url/
+    /// show_qrcode_url;errcode/errmsg 由 Service 折叠,不建模)。
+    pub const QrcodeCreateResult = struct {
+        gpa: std.mem.Allocator,
+        ticket: []u8,
+        expire_seconds: i64,
+        url: []u8,
+        show_qrcode_url: []u8,
+
+        pub fn deinit(self: *QrcodeCreateResult) void {
+            self.gpa.free(self.ticket);
+            self.gpa.free(self.url);
+            self.gpa.free(self.show_qrcode_url);
+            self.* = undefined;
+        }
+
+        pub fn fromJson(gpa: std.mem.Allocator, v: json_util.Value) !QrcodeCreateResult {
+            return .{
+                .gpa = gpa,
+                .ticket = try strOf(gpa, v, "ticket"),
+                .expire_seconds = json_util.getIntOr(v, "expire_seconds", 0),
+                .url = try strOf(gpa, v, "url"),
+                .show_qrcode_url = try strOf(gpa, v, "show_qrcode_url"),
+            };
+        }
+    };
+
+    /// Java 3 个 createQrcodeCard 重载的参数包(cardId/outerStr 必填,其余默认:
+    /// expiresIn=0 不发 expire_seconds;openid/code=null 不入 body;
+    /// isUniqueCode=false)。
+    pub const QrcodeOptions = struct {
+        expire_seconds: i64 = 0,
+        openid: ?[]const u8 = null,
+        code: ?[]const u8 = null,
+        is_unique_code: bool = false,
+    };
+
+    /// 对应 `#createQrcodeCard(cardId,outerStr,expiresIn,openid,code,isUniqueCode)`
+    /// (impl:199-231):三层嵌套 body(action_name/expire_seconds?/action_info.card)
+    /// → POST CARD_QRCODE_CREATE → QrcodeCreateResult.fromJson。
+    pub fn createQrcodeCard(self: *CardService, io: std.Io, card_id: []const u8, outer_str: []const u8, opts: QrcodeOptions) WxResult(QrcodeCreateResult) {
+        const gpa = self.svc.gpa;
+        // 一次性嵌套容器走 arena(字符串借用自入参)
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var card_map: json_util.ObjectMap = .empty;
+        if (opts.openid) |o| card_map.put(a, "openid", .{ .string = o }) catch
+            return .{ .err = oom(gpa) };
+        if (opts.code) |c| card_map.put(a, "code", .{ .string = c }) catch
+            return .{ .err = oom(gpa) };
+        card_map.put(a, "is_unique_code", .{ .bool = opts.is_unique_code }) catch
+            return .{ .err = oom(gpa) };
+        card_map.put(a, "card_id", .{ .string = card_id }) catch
+            return .{ .err = oom(gpa) };
+        card_map.put(a, "outer_str", .{ .string = outer_str }) catch
+            return .{ .err = oom(gpa) };
+        var action_info: json_util.ObjectMap = .empty;
+        action_info.put(a, "card", .{ .object = card_map }) catch
+            return .{ .err = oom(gpa) };
+        var root: json_util.ObjectMap = .empty;
+        root.put(a, "action_name", .{ .string = "QR_CARD" }) catch
+            return .{ .err = oom(gpa) };
+        if (opts.expire_seconds > 0) root.put(a, "expire_seconds", .{ .integer = opts.expire_seconds }) catch
+            return .{ .err = oom(gpa) };
+        root.put(a, "action_info", .{ .object = action_info }) catch
+            return .{ .err = oom(gpa) };
+        // 必须传 Value(匿名 struct 会按字段序列化 ObjectMap 内部)
+        const body = json_util.stringify(gpa, json_util.Value{ .object = root }) catch
+            return .{ .err = oom(gpa) };
+        defer gpa.free(body);
+
+        const resp = switch (h.apiPost(self.svc, io, api_url.Card.card_qrcode_create, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch
+            return .{ .err = result_mod.WxError.transport(gpa, "qrcode create response not json", .{}) };
+        defer parsed.deinit();
+        return .{ .ok = QrcodeCreateResult.fromJson(gpa, parsed.value) catch
+            return .{ .err = result_mod.WxError.transport(gpa, "qrcode create response parse failed", .{}) } };
+    }
+
+    /// 对应 Java bean `WxMpCardLandingPageCreateRequest`
+    /// (banner/page_title/can_share/scene/card_list);card_list 是 JsonArray,
+    /// Zig 侧传原始 JSON 数组文本 `card_list_json`(原样内嵌,不转义)。
+    pub const LandingPageCreateRequest = struct {
+        banner: []const u8,
+        page_title: []const u8,
+        can_share: bool = false,
+        scene: []const u8,
+        card_list_json: []const u8,
+    };
+
+    /// 对应 Java bean `WxMpCardLandingPageCreateResult`(url/page_id;
+    /// errcode/errmsg 由 Service 折叠,不建模)。
+    pub const LandingPageCreateResult = struct {
+        gpa: std.mem.Allocator,
+        url: []u8,
+        page_id: i64,
+
+        pub fn deinit(self: *LandingPageCreateResult) void {
+            self.gpa.free(self.url);
+            self.* = undefined;
+        }
+
+        pub fn fromJson(gpa: std.mem.Allocator, v: json_util.Value) !LandingPageCreateResult {
+            return .{
+                .gpa = gpa,
+                .url = try strOf(gpa, v, "url"),
+                .page_id = json_util.getIntOr(v, "page_id", 0),
+            };
+        }
+    };
+
+    /// 对应 `#createLandingPage(request)`(impl:233-238):
+    /// POST CARD_LANDING_PAGE_CREATE → LandingPageCreateResult.fromJson。
+    pub fn createLandingPage(self: *CardService, io: std.Io, req: LandingPageCreateRequest) WxResult(LandingPageCreateResult) {
+        const gpa = self.svc.gpa;
+        const body = landingPageBody(gpa, req) catch
+            return .{ .err = oom(gpa) };
+        defer gpa.free(body);
+        const resp = switch (h.apiPost(self.svc, io, api_url.Card.card_landing_page_create, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch
+            return .{ .err = result_mod.WxError.transport(gpa, "landingpage response not json", .{}) };
+        defer parsed.deinit();
+        return .{ .ok = LandingPageCreateResult.fromJson(gpa, parsed.value) catch
+            return .{ .err = result_mod.WxError.transport(gpa, "landingpage response parse failed", .{}) } };
+    }
 };
+
+/// 手写 body(字段序逐字对齐 Java bean 声明序):
+/// {"banner":..,"page_title":..,"can_share":bool,"scene":..,"card_list":<原样内嵌>}。
+fn landingPageBody(gpa: std.mem.Allocator, req: CardService.LandingPageCreateRequest) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"banner\":");
+    try jw.str(w, req.banner);
+    try w.writeAll(",\"page_title\":");
+    try jw.str(w, req.page_title);
+    try w.writeAll(",\"can_share\":");
+    try w.print("{}", .{req.can_share});
+    try w.writeAll(",\"scene\":");
+    try jw.str(w, req.scene);
+    try w.writeAll(",\"card_list\":");
+    try w.writeAll(req.card_list_json);
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
 
 // ---------------------------------------------------------------------------
 // 契约测试:14 端点 URL/method/请求体 + decryptCardCode 响应字段
@@ -512,4 +790,105 @@ test "Card 契约: 3 端点 (mpnewsGethtml/selfConsumeCellSet/userCardList)" {
 
     try testing.expectEqual(@as(usize, 3), mock.calls);
     try testing.expect(std.mem.indexOf(u8, mock.uri(), "access_token=TOK") != null);
+}
+
+test "Card 契约: ticket/签名/QR_CARD/landingpage (WxMpCardServiceImpl:22-238)" {
+    const gpa = testing.allocator;
+    var mock = h.Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "card/qrcode/create", .response = "{\"errcode\":0,\"ticket\":\"QR_TICKET\",\"expire_seconds\":120,\"url\":\"http://u\",\"show_qrcode_url\":\"http://q\"}" },
+        .{ .match = "card/landingpage/create", .response = "{\"errcode\":0,\"url\":\"http://lp\",\"page_id\":9}" },
+        .{ .match = "ticket/getticket", .response = "{\"errcode\":0,\"ticket\":\"CARD_TICKET\",\"expires_in\":7200}" },
+    } };
+    var fx: h.Fixture = undefined;
+    try h.setup(gpa, &mock, &fx);
+    defer h.teardown(&fx);
+    var svc = CardService{ .svc = &fx.svc };
+    const io = fx.threaded.io();
+
+    // 1 CARD_GET_TICKET: GET → ticket(force_refresh 本版不生效,现取)
+    switch (svc.getCardApiTicket(io, true)) {
+        .ok => |t| {
+            defer gpa.free(t);
+            try testing.expectEqualStrings("CARD_TICKET", t);
+        },
+        .err => return error.UnexpectedTicket,
+    }
+    try testing.expectEqualStrings("get", mock.last_method);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/ticket/getticket?type=wx_card") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "access_token=TOK") != null);
+
+    // 2 createCardApiSignature: optional ++ [ts,nonce,ticket] → sort → 无分隔拼接 SHA1
+    var sig = switch (svc.createCardApiSignature(io, &.{ "APPID", "OPENID" }, .{
+        .nonce_str = "NONCE",
+        .timestamp = 1700000000,
+    })) {
+        .ok => |s| s,
+        .err => return error.UnexpectedSignature,
+    };
+    defer sig.deinit();
+    var expect_buf: [40]u8 = undefined;
+    // 排序后 digits < 大写字母:1700000000 < APPID < CARD_TICKET < NONCE < OPENID
+    // (用 hex 而非 gen 避免循环验证)
+    const expected = sha1.hex(&expect_buf, "1700000000APPIDCARD_TICKETNONCEOPENID");
+    try testing.expectEqualStrings(expected, sig.signature);
+    try testing.expectEqual(@as(i64, 1700000000), sig.timestamp);
+    try testing.expectEqualStrings("NONCE", sig.nonce_str);
+    try testing.expectEqual(@as(usize, 2), mock.calls); // 签名内部又取了一次 ticket
+
+    // 3 createQrcodeCard(全参数): QR_CARD + expire_seconds + action_info.card
+    var qr = switch (svc.createQrcodeCard(io, "CARD_ID", "OUTER", .{
+        .expire_seconds = 120,
+        .openid = "oX",
+        .code = "CD",
+        .is_unique_code = true,
+    })) {
+        .ok => |r| r,
+        .err => return error.UnexpectedQrcode,
+    };
+    defer qr.deinit();
+    try testing.expectEqualStrings("QR_TICKET", qr.ticket);
+    try testing.expectEqual(@as(i64, 120), qr.expire_seconds);
+    try testing.expectEqualStrings("http://u", qr.url);
+    try testing.expectEqualStrings("http://q", qr.show_qrcode_url);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "card/qrcode/create") != null);
+    var body = mock.body();
+    try testing.expect(std.mem.indexOf(u8, body, "\"action_name\":\"QR_CARD\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"expire_seconds\":120") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"openid\":\"oX\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"code\":\"CD\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"is_unique_code\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"card_id\":\"CARD_ID\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"outer_str\":\"OUTER\"") != null);
+
+    // 4 createQrcodeCard(默认值): expire_seconds=0 不发,openid/code 缺省,is_unique_code:false
+    var qr2 = switch (svc.createQrcodeCard(io, "CARD_ID", "OUTER", .{})) {
+        .ok => |r| r,
+        .err => return error.UnexpectedQrcode2,
+    };
+    defer qr2.deinit();
+    body = mock.body();
+    try testing.expect(std.mem.indexOf(u8, body, "expire_seconds") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"openid\"") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"code\"") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"is_unique_code\":false") != null);
+
+    // 5 createLandingPage: 字段序逐字对齐 Java bean 声明序;card_list 原样内嵌
+    var lp = switch (svc.createLandingPage(io, .{
+        .banner = "BAN",
+        .page_title = "TIT",
+        .can_share = true,
+        .scene = "SC",
+        .card_list_json = "[{\"card_id\":\"C1\"}]",
+    })) {
+        .ok => |r| r,
+        .err => return error.UnexpectedLandingPage,
+    };
+    defer lp.deinit();
+    try testing.expectEqualStrings("http://lp", lp.url);
+    try testing.expectEqual(@as(i64, 9), lp.page_id);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "card/landingpage/create") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "{\"banner\":\"BAN\",\"page_title\":\"TIT\",\"can_share\":true,\"scene\":\"SC\",\"card_list\":[{\"card_id\":\"C1\"}]}") != null);
+
+    // ticket + 签名内部 ticket + qr + qr2 + lp
+    try testing.expectEqual(@as(usize, 5), mock.calls);
 }

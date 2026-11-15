@@ -2,7 +2,8 @@
 //! `api.impl.WxMpDataCubeServiceImpl`。
 //!
 //! 全部接口同形:POST `{"begin_date":..,"end_date":..}` → `{"list":[{..},..]}`。
-//! 前 8 项 URL 对应 Java `enums.WxMpApiUrl.DataCube` 常量;
+//! 17 项 URL 逐字对应 Java `enums.WxMpApiUrl.DataCube` 常量(用户/图文/分享/
+//! 上行消息/接口分析五族);
 //! `getarticleshare/getarticledetail/getupdatetime` 在本 checkout 的 Java 枚举中
 //! **不存在**(新版官方文档接口),按任务清单以常量表补齐并逐一实现。
 //!
@@ -39,6 +40,24 @@ pub const Path = struct {
     pub const get_article_detail = "datacube/getarticledetail";
     /// 数据时间 —— Java 枚举无此常量(官方文档 /datacube/getupdatetime)。
     pub const get_updatetime = "datacube/getupdatetime";
+    /// `GET_UPSTREAM_MSG`:消息发送概况数据。
+    pub const get_upstream_msg = "datacube/getupstreammsg";
+    /// `GET_UPSTREAM_MSG_HOUR`:消息发送概况分时数据。
+    pub const get_upstream_msg_hour = "datacube/getupstreammsghour";
+    /// `GET_UPSTREAM_MSG_WEEK`:消息发送概况周数据。
+    pub const get_upstream_msg_week = "datacube/getupstreammsgweek";
+    /// `GET_UPSTREAM_MSG_MONTH`:消息发送概况月数据。
+    pub const get_upstream_msg_month = "datacube/getupstreammsgmonth";
+    /// `GET_UPSTREAM_MSG_DIST`:消息发送分布数据。
+    pub const get_upstream_msg_dist = "datacube/getupstreammsgdist";
+    /// `GET_UPSTREAM_MSG_DIST_WEEK`:消息发送分布周数据。
+    pub const get_upstream_msg_dist_week = "datacube/getupstreammsgdistweek";
+    /// `GET_UPSTREAM_MSG_DIST_MONTH`:消息发送分布月数据。
+    pub const get_upstream_msg_dist_month = "datacube/getupstreammsgdistmonth";
+    /// `GET_INTERFACE_SUMMARY`:接口分析数据。
+    pub const get_interface_summary = "datacube/getinterfacesummary";
+    /// `GET_INTERFACE_SUMMARY_HOUR`:接口分析分时数据。
+    pub const get_interface_summary_hour = "datacube/getinterfacesummaryhour";
 };
 
 /// 接口清单(常量表数组形式,便于枚举/遍历)。
@@ -54,6 +73,15 @@ pub const endpoints = [_]struct { name: []const u8, path: []const u8 }{
     .{ .name = "get_article_share", .path = Path.get_article_share },
     .{ .name = "get_article_detail", .path = Path.get_article_detail },
     .{ .name = "get_updatetime", .path = Path.get_updatetime },
+    .{ .name = "get_upstream_msg", .path = Path.get_upstream_msg },
+    .{ .name = "get_upstream_msg_hour", .path = Path.get_upstream_msg_hour },
+    .{ .name = "get_upstream_msg_week", .path = Path.get_upstream_msg_week },
+    .{ .name = "get_upstream_msg_month", .path = Path.get_upstream_msg_month },
+    .{ .name = "get_upstream_msg_dist", .path = Path.get_upstream_msg_dist },
+    .{ .name = "get_upstream_msg_dist_week", .path = Path.get_upstream_msg_dist_week },
+    .{ .name = "get_upstream_msg_dist_month", .path = Path.get_upstream_msg_dist_month },
+    .{ .name = "get_interface_summary", .path = Path.get_interface_summary },
+    .{ .name = "get_interface_summary_hour", .path = Path.get_interface_summary_hour },
 };
 
 /// 校验 `YYYY-MM-DD`(长度/横线位/数字位;不做日历级校验,与任务要求一致)。
@@ -238,6 +266,51 @@ pub const DataCubeService = struct {
     /// 数据时间 —— Java 本 checkout 无常量(官方 /datacube/getupdatetime)。
     pub fn getUpdatetime(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
         return self.query(io, Path.get_updatetime, begin_date, end_date);
+    }
+
+    /// 对应 `#getUpstreamMsg`(GET_UPSTREAM_MSG,impl:78-80)。
+    pub fn getUpstreamMsg(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_upstream_msg, begin_date, end_date);
+    }
+
+    /// 对应 `#getUpstreamMsgHour`(GET_UPSTREAM_MSG_HOUR,行含 ref_hour)。
+    pub fn getUpstreamMsgHour(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_upstream_msg_hour, begin_date, end_date);
+    }
+
+    /// 对应 `#getUpstreamMsgWeek`(GET_UPSTREAM_MSG_WEEK)。
+    pub fn getUpstreamMsgWeek(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_upstream_msg_week, begin_date, end_date);
+    }
+
+    /// 对应 `#getUpstreamMsgMonth`(GET_UPSTREAM_MSG_MONTH)。
+    pub fn getUpstreamMsgMonth(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_upstream_msg_month, begin_date, end_date);
+    }
+
+    /// 对应 `#getUpstreamMsgDist`(GET_UPSTREAM_MSG_DIST)。
+    pub fn getUpstreamMsgDist(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_upstream_msg_dist, begin_date, end_date);
+    }
+
+    /// 对应 `#getUpstreamMsgDistWeek`(GET_UPSTREAM_MSG_DIST_WEEK)。
+    pub fn getUpstreamMsgDistWeek(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_upstream_msg_dist_week, begin_date, end_date);
+    }
+
+    /// 对应 `#getUpstreamMsgDistMonth`(GET_UPSTREAM_MSG_DIST_MONTH)。
+    pub fn getUpstreamMsgDistMonth(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_upstream_msg_dist_month, begin_date, end_date);
+    }
+
+    /// 对应 `#getInterfaceSummary`(GET_INTERFACE_SUMMARY)。
+    pub fn getInterfaceSummary(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_interface_summary, begin_date, end_date);
+    }
+
+    /// 对应 `#getInterfaceSummaryHour`(GET_INTERFACE_SUMMARY_HOUR,行含 ref_hour)。
+    pub fn getInterfaceSummaryHour(self: *DataCubeService, io: std.Io, begin_date: []const u8, end_date: []const u8) WxResult([]Row) {
+        return self.query(io, Path.get_interface_summary_hour, begin_date, end_date);
     }
 };
 
@@ -444,8 +517,9 @@ test "datacube: 日期校验 + 接口清单常量表" {
     }
     try testing.expectEqual(@as(usize, 0), mock.calls);
 
-    // 接口清单:11 项、路径齐备(前 8 项与 Java DataCube 枚举一致)
-    try testing.expectEqual(@as(usize, 11), endpoints.len);
+    // 接口清单:20 项、路径齐备(其中 17 项与 Java DataCube 枚举一致,
+    // getarticleshare/getarticledetail/getupdatetime 为官方文档接口)
+    try testing.expectEqual(@as(usize, 20), endpoints.len);
     for (endpoints) |ep| {
         try testing.expect(std.mem.startsWith(u8, ep.path, "datacube/"));
     }
@@ -453,4 +527,55 @@ test "datacube: 日期校验 + 接口清单常量表" {
     try testing.expectEqualStrings("datacube/getusercumulate", Path.get_user_cumulate);
     try testing.expectEqualStrings("datacube/getarticlesummary", Path.get_article_summary);
     try testing.expectEqualStrings("datacube/getarticletotal", Path.get_article_total);
+    try testing.expectEqualStrings("datacube/getupstreammsg", Path.get_upstream_msg);
+    try testing.expectEqualStrings("datacube/getupstreammsgdistmonth", Path.get_upstream_msg_dist_month);
+    try testing.expectEqualStrings("datacube/getinterfacesummary", Path.get_interface_summary);
+    try testing.expectEqualStrings("datacube/getinterfacesummaryhour", Path.get_interface_summary_hour);
+}
+
+// 其余 16 个同构包装方法(getUserSummary/getUserReadHour/getArticleSummary/
+// getUserCumulate 已在上方测试):逐个调用断言 method→Path 接线与请求体日期。
+test "datacube: 其余 16 个端点方法→Path 接线" {
+    const gpa = testing.allocator;
+    var mock = Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "datacube/", .response = "{\"list\":[{\"ref_date\":\"2026-01-01\",\"ref_hour\":0,\"int_page_read_user\":1}]}" },
+    } };
+    var threaded: std.Io.Threaded = undefined;
+    var cfg: config_mod.InMemoryConfigStorage = undefined;
+    var base: service_mod.Service = undefined;
+    try setup(gpa, &mock, &threaded, &cfg, &base);
+    defer threaded.deinit();
+    defer cfg.deinit();
+    var svc = DataCubeService{ .svc = &base };
+    const io = threaded.io();
+
+    // @field 从类型取方法声明(同 device.zig 的做法);元组 = {方法名, 期望路径}
+    inline for (.{
+        .{ "getUserRead", "datacube/getuserread" },
+        .{ "getUserShare", "datacube/getusershare" },
+        .{ "getUserShareHour", "datacube/getusersharehour" },
+        .{ "getArticleTotal", "datacube/getarticletotal" },
+        .{ "getArticleShare", "datacube/getarticleshare" },
+        .{ "getArticleDetail", "datacube/getarticledetail" },
+        .{ "getUpdatetime", "datacube/getupdatetime" },
+        .{ "getUpstreamMsg", "datacube/getupstreammsg" },
+        .{ "getUpstreamMsgHour", "datacube/getupstreammsghour" },
+        .{ "getUpstreamMsgWeek", "datacube/getupstreammsgweek" },
+        .{ "getUpstreamMsgMonth", "datacube/getupstreammsgmonth" },
+        .{ "getUpstreamMsgDist", "datacube/getupstreammsgdist" },
+        .{ "getUpstreamMsgDistWeek", "datacube/getupstreammsgdistweek" },
+        .{ "getUpstreamMsgDistMonth", "datacube/getupstreammsgdistmonth" },
+        .{ "getInterfaceSummary", "datacube/getinterfacesummary" },
+        .{ "getInterfaceSummaryHour", "datacube/getinterfacesummaryhour" },
+    }) |case| {
+        const method = @field(DataCubeService, case[0]);
+        const rows = try expectQuery(&mock, method(&svc, io, "2026-01-01", "2026-01-01"), case[1], "2026-01-01", "2026-01-01");
+        defer if (rows.len != 0) gpa.free(rows);
+        defer for (rows) |*r| {
+            var tmp = r.*;
+            tmp.deinit();
+        };
+        try testing.expectEqual(@as(usize, 1), rows.len);
+    }
+    try testing.expectEqual(@as(usize, 16), mock.calls);
 }

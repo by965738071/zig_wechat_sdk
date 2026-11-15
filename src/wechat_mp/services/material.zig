@@ -4,6 +4,12 @@
 //! 上传类接口(`materialFileUpload` 等)在 Java 走 `MaterialUploadRequestExecutor`
 //! 的 multipart/form-data;本骨架用**纯本地组包**(boundary + parts 拼 body)+
 //! 现有 RequestExecutor 字节流通道实现,组包是纯逻辑、可离线单测,不引入 HTTP 栈。
+//!
+//! 收录对照:materialCount→count、materialFileBatchGet/newsBatchGet→batchget、
+//! materialImageOrVoiceDownload→get、materialDelete→delete、
+//! materialFileUpload→add/addVideo、materialVideoInfo→videoInfo、
+//! materialNewsInfo→newsInfo(原样透传)。未收录:mediaUpload/mediaDownload/
+//! jssdkMediaDownload/mediaImgUpload(归 `media.zig`,避免与临时素材重复)。
 const std = @import("std");
 const json_util = @import("common").json_util;
 const result_mod = @import("common").result;
@@ -23,7 +29,7 @@ pub const Path = struct {
     pub const get_material = "cgi-bin/material/get_material";
     /// `MATERIAL_DEL_URL`:删除永久素材。
     pub const del_material = "cgi-bin/material/del_material";
-    /// `MATERIAL_ADD_URL`:新增永久素材(multipart,`?type=%s`,未实现)。
+    /// `MATERIAL_ADD_URL`:新增永久素材(multipart,`?type=%s`)。
     pub const add_material = "cgi-bin/material/add_material";
 };
 
@@ -241,6 +247,67 @@ pub const MaterialService = struct {
         return postVoid(self.svc, io, Path.del_material, body);
     }
 
+    /// 视频永久素材详情 —— 对应 `WxMpMaterialVideoInfoResult`
+    /// (title / description / downUrl;字段名取自
+    /// `WxMpMaterialVideoInfoResultAdapter`:down_url)。
+    pub const VideoInfo = struct {
+        gpa: std.mem.Allocator,
+        title: []u8,
+        description: []u8,
+        down_url: []u8,
+
+        pub fn deinit(self: *VideoInfo) void {
+            self.gpa.free(self.title);
+            self.gpa.free(self.description);
+            self.gpa.free(self.down_url);
+            self.* = undefined;
+        }
+    };
+
+    /// 对应 `WxMpMaterialServiceImpl#materialVideoInfo`(impl:92-98):
+    /// POST cgi-bin/material/get_material {media_id}
+    /// (MaterialVideoInfoRequestExecutor,StringEntity)→ VideoInfo.fromJson。
+    pub fn videoInfo(self: *MaterialService, io: std.Io, media_id: []const u8) WxResult(VideoInfo) {
+        const gpa = self.svc.gpa;
+        const body = mediaIdBody(gpa, media_id) catch
+            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        defer gpa.free(body);
+        const resp = switch (apiPost(self.svc, io, Path.get_material, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch
+            return .{ .err = result_mod.WxError.transport(gpa, "get_material response not json", .{}) };
+        defer parsed.deinit();
+        const v = parsed.value;
+        // 对应 Adapter:三字段均可能缺省(null 跳过),这里宽容缺省为空串。
+        const vi = VideoInfo{
+            .gpa = gpa,
+            .title = gpa.dupe(u8, json_util.getStrOr(v, "title", "")) catch
+                return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) },
+            .description = gpa.dupe(u8, json_util.getStrOr(v, "description", "")) catch
+                return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) },
+            .down_url = gpa.dupe(u8, json_util.getStrOr(v, "down_url", "")) catch
+                return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) },
+        };
+        return .{ .ok = vi };
+    }
+
+    /// 对应 `WxMpMaterialServiceImpl#materialNewsInfo`(impl:100-104):
+    /// POST cgi-bin/material/get_material {media_id}
+    /// (MaterialNewsInfoRequestExecutor)→ `WxMpMaterialNews`
+    /// (create_time/update_time/articles[],article 全量字段见 add_news)。
+    /// **口径**:该 bean 字段过多,按既有惯例原样返回响应 body
+    /// (与 queryCardCode/getCardDetail 同口径),不建 articles 结构体。
+    pub fn newsInfo(self: *MaterialService, io: std.Io, media_id: []const u8) WxResult([]u8) {
+        const gpa = self.svc.gpa;
+        const body = mediaIdBody(gpa, media_id) catch
+            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        defer gpa.free(body);
+        return apiPost(self.svc, io, Path.get_material, body);
+    }
+
     /// 新增永久素材结果 —— 对应 `WxMpMaterialUploadResult`(mediaId / url)。
     pub const AddResult = struct {
         gpa: std.mem.Allocator,
@@ -282,7 +349,7 @@ pub const MaterialService = struct {
             return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(boundary);
 
-        const body = buildMultipartBody(gpa, boundary, filename, content, description) catch |e|
+        const body = buildMultipartBody(gpa, boundary, "media", filename, content, description) catch |e|
             return .{ .err = result_mod.WxError.internal(gpa, "multipart body: {s}", .{@errorName(e)}) };
         defer gpa.free(body);
 
@@ -338,9 +405,12 @@ fn hasHeaderInjection(s: []const u8) bool {
 }
 
 /// 拼 multipart/form-data body(纯逻辑、可离线单测)。字段名/格式逐字对照 Java:
-///  - `media` 部分:name="media"; filename="<filename>",Content-Type: application/octet-stream,
-///    文件二进制(对应 OkHttp `addFormDataPart("media", name, octet-stream)` /
-///    Apache `addBinaryBody("media", file)`)。
+///  - 文件部分:name="<field_name>"; filename="<filename>",
+///    Content-Type: application/octet-stream,文件二进制。
+///    `field_name` 逐字对照各 Java 执行器的 `addBinaryBody(name, file)`:
+///    素材/语音传 `media`(MaterialUploadRequestExecutor /
+///    MediaImgUploadRequestExecutor / AiOpen 语音),OCR/ImgProc 识别传 `file`
+///    (OcrDiscernRequestExecutor,RFC6532 模式)。
 ///  - `description` 部分(视频,可选):name="description",
 ///    Content-Type: text/plain; charset=UTF-8,内容 = 表单 JSON
 ///    (对应 Apache `new StringBody(json, TEXT_PLAIN.withCharset(UTF_8))`)。
@@ -348,21 +418,25 @@ fn hasHeaderInjection(s: []const u8) bool {
 pub fn buildMultipartBody(
     gpa: std.mem.Allocator,
     boundary: []const u8,
+    field_name: []const u8,
     filename: []const u8,
     content: []const u8,
     description: ?[]const u8,
 ) ![]u8 {
     if (boundary.len == 0 or hasHeaderInjection(boundary)) return error.InvalidBoundary;
+    if (hasHeaderInjection(field_name)) return error.InvalidFieldName;
     if (hasHeaderInjection(filename)) return error.InvalidFilename;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
-    // -- media 部分 --
+    // -- 文件部分 --
     try out.appendSlice(gpa, "--");
     try out.appendSlice(gpa, boundary);
     try out.appendSlice(gpa, "\r\n");
-    try out.appendSlice(gpa, "Content-Disposition: form-data; name=\"media\"; filename=\"");
+    try out.appendSlice(gpa, "Content-Disposition: form-data; name=\"");
+    try out.appendSlice(gpa, field_name);
+    try out.appendSlice(gpa, "\"; filename=\"");
     try out.appendSlice(gpa, filename);
     try out.appendSlice(gpa, "\"\r\n");
     try out.appendSlice(gpa, "Content-Type: application/octet-stream\r\n\r\n");
@@ -658,7 +732,7 @@ test "material get / delete / add 未实现 / errcode!=0" {
 
 test "buildMultipartBody: exact bytes, media + description, boundary; header injection rejected" {
     const gpa = testing.allocator;
-    const body = try buildMultipartBody(gpa, "BOUND123", "pic.png", "\x89PNG\r\n", "{\"title\":\"t\"}");
+    const body = try buildMultipartBody(gpa, "BOUND123", "media", "pic.png", "\x89PNG\r\n", "{\"title\":\"t\"}");
     defer gpa.free(body);
     const expect =
         "--BOUND123\r\n" ++
@@ -677,21 +751,27 @@ test "buildMultipartBody: exact bytes, media + description, boundary; header inj
     try testing.expectEqualStrings(expect, body);
 
     // 无 description 时不应出现该部分
-    const body2 = try buildMultipartBody(gpa, "B", "f.bin", "XYZ", null);
+    const body2 = try buildMultipartBody(gpa, "B", "media", "f.bin", "XYZ", null);
     defer gpa.free(body2);
     try testing.expect(std.mem.indexOf(u8, body2, "name=\"description\"") == null);
     try testing.expect(std.mem.endsWith(u8, body2, "--B--\r\n"));
+
+    // OCR/ImgProc 执行器用字段名 file(OcrDiscernRequestExecutor)
+    const body3 = try buildMultipartBody(gpa, "B", "file", "f.jpg", "JPEG", null);
+    defer gpa.free(body3);
+    try testing.expect(std.mem.indexOf(u8, body3, "name=\"file\"; filename=\"f.jpg\"") != null);
 
     // multipartContentType(供 header-capable 执行器使用)
     const ct = try multipartContentType(gpa, "BOUND123");
     defer gpa.free(ct);
     try testing.expectEqualStrings("multipart/form-data; boundary=BOUND123", ct);
 
-    // 头注入防护:filename / boundary 含 CRLF 或引号 -> 拒绝(不生成非法头)
-    try testing.expectError(error.InvalidFilename, buildMultipartBody(gpa, "B", "a\r\nb", "x", null));
-    try testing.expectError(error.InvalidFilename, buildMultipartBody(gpa, "B", "a\"b", "x", null));
-    try testing.expectError(error.InvalidBoundary, buildMultipartBody(gpa, "B\r\nX", "f", "x", null));
-    try testing.expectError(error.InvalidBoundary, buildMultipartBody(gpa, "", "f", "x", null));
+    // 头注入防护:field_name / filename / boundary 含 CRLF 或引号 -> 拒绝(不生成非法头)
+    try testing.expectError(error.InvalidFieldName, buildMultipartBody(gpa, "B", "a\r\nb", "f", "x", null));
+    try testing.expectError(error.InvalidFilename, buildMultipartBody(gpa, "B", "media", "a\r\nb", "x", null));
+    try testing.expectError(error.InvalidFilename, buildMultipartBody(gpa, "B", "media", "a\"b", "x", null));
+    try testing.expectError(error.InvalidBoundary, buildMultipartBody(gpa, "B\r\nX", "media", "f", "x", null));
+    try testing.expectError(error.InvalidBoundary, buildMultipartBody(gpa, "", "media", "f", "x", null));
 }
 
 // ---------------------------------------------------------------------------
@@ -788,4 +868,110 @@ test "material add sends multipart Content-Type through execute_with_headers" {
     // multipart body 也确实发出(含 boundary + 文件名)
     try testing.expect(std.mem.indexOf(u8, cap.captured_body, "name=\"media\"") != null);
     try testing.expect(std.mem.indexOf(u8, cap.captured_body, "a.png") != null);
+}
+
+test "material addVideo: multipart(type=video) + description 表单字段 + 解析" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cap = HeaderCapture{ .gpa = gpa, .response = "{\"media_id\":\"VID1\",\"url\":\"http://v\"}" };
+    defer cap.deinit();
+    var cfg = try config_mod.InMemoryConfigStorage.init(
+        gpa,
+        .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } },
+        .{ .appid = "A", .secret = "S" },
+    );
+    defer cfg.deinit();
+    var base = service_mod.Service.init(gpa, cfg.config(), cap.executor());
+    var svc = MaterialService{ .svc = &base };
+
+    switch (svc.addVideo(io, "v.mp4", "VIDEOBYTES", "{\"title\":\"视频标题\",\"introduction\":\"介绍\"}")) {
+        .ok => |*r| {
+            var res = r.*;
+            defer res.deinit();
+            try testing.expectEqualStrings("VID1", res.media_id);
+            try testing.expectEqualStrings("http://v", res.url);
+        },
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.UnexpectedAddVideoError;
+        },
+    }
+    try testing.expectEqual(@as(usize, 1), cap.calls);
+    try testing.expect(std.mem.startsWith(u8, cap.captured_ct, "multipart/form-data; boundary=WxZig"));
+    // media 部件:文件名 + 字节;description 部件:原样 JSON
+    try testing.expect(std.mem.indexOf(u8, cap.captured_body, "name=\"media\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.captured_body, "v.mp4") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.captured_body, "VIDEOBYTES") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.captured_body, "name=\"description\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.captured_body, "\"title\":\"视频标题\"") != null);
+}
+
+test "material videoInfo / newsInfo: get_material POST {media_id} + 解析/透传" {
+    const gpa = testing.allocator;
+    // videoInfo 与 newsInfo 同 URL,Recorder 按序取首个命中,故分两个 mock。
+    var mock = Recorder{
+        .gpa = gpa,
+        .entries = &.{
+            .{ .match = "get_material", .response = "{\"title\":\"视频标题\",\"description\":\"简介\",\"down_url\":\"http://dl\"}" },
+        },
+    };
+    var threaded: std.Io.Threaded = undefined;
+    var cfg: config_mod.InMemoryConfigStorage = undefined;
+    var base: service_mod.Service = undefined;
+    try setup(gpa, &mock, &threaded, &cfg, &base);
+    defer threaded.deinit();
+    defer cfg.deinit();
+    var svc = MaterialService{ .svc = &base };
+    const io = threaded.io();
+
+    // videoInfo:三字段(down_url 字段名取自 WxMpMaterialVideoInfoResultAdapter)
+    switch (svc.videoInfo(io, "VIDEO_MID")) {
+        .ok => |v| {
+            var vi = v;
+            defer vi.deinit();
+            try testing.expectEqualStrings("视频标题", vi.title);
+            try testing.expectEqualStrings("简介", vi.description);
+            try testing.expectEqualStrings("http://dl", vi.down_url);
+        },
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.UnexpectedVideoInfo;
+        },
+    }
+    try testing.expectEqualStrings("post", mock.last_method);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/material/get_material") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.body(), "\"media_id\":\"VIDEO_MID\"") != null);
+
+    // newsInfo:复杂 bean 原样透传(与 queryCardCode 同口径)
+    var mock2 = Recorder{
+        .gpa = gpa,
+        .entries = &.{
+            .{ .match = "get_material", .response = "{\"create_time\":1700000000,\"update_time\":1700001000,\"articles\":[{\"title\":\"T1\"}]}" },
+        },
+    };
+    var th2: std.Io.Threaded = undefined;
+    var cfg2: config_mod.InMemoryConfigStorage = undefined;
+    var base2: service_mod.Service = undefined;
+    try setup(gpa, &mock2, &th2, &cfg2, &base2);
+    defer th2.deinit();
+    defer cfg2.deinit();
+    var svc2 = MaterialService{ .svc = &base2 };
+    switch (svc2.newsInfo(th2.io(), "NEWS_MID")) {
+        .ok => |raw| {
+            defer gpa.free(raw);
+            try testing.expect(std.mem.indexOf(u8, raw, "\"articles\"") != null);
+            try testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"T1\"") != null);
+        },
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.UnexpectedNewsInfo;
+        },
+    }
+    try testing.expect(std.mem.indexOf(u8, mock2.body(), "\"media_id\":\"NEWS_MID\"") != null);
 }

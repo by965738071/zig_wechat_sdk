@@ -7,6 +7,8 @@
 //! - OAUTH2_USERINFO_URL     → /sns/userinfo?access_token=%s&openid=%s&lang=%s
 //! - OAUTH2_VALIDATE_TOKEN_URL → /sns/auth?access_token=%s&openid=%s
 //! - CONNECT_OAUTH2_AUTHORIZE_URL → https://open.weixin.qq.com/connect/oauth2/authorize?appid=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s&connect_redirect=1#wechat_redirect
+//! - QRCONNECT_URL → https://open.weixin.qq.com/connect/qrconnect?appid=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s#wechat_redirect
+//!   (Java 在 BaseWxMpServiceImpl#buildQrConnectUrl 里直接 sprintf,不在 OAuth2 服务里)
 //!
 //! 全部走 `Service.executeNoToken`(网页授权 token 与 API token 无关,与 Java 一致)。
 const std = @import("std");
@@ -154,6 +156,22 @@ pub const OauthService = struct {
         };
     }
 
+    /// 对应 `BaseWxMpServiceImpl#buildQrConnectUrl(redirectUri, scope, state)`
+    /// (impl:334-337 + `WxMpApiUrl.QRCONNECT_URL`):开放平台扫码登录 URL。
+    /// redirect_uri 做 encodeURIComponent;state 语义同 buildAuthorizationUrl。
+    pub fn buildQrConnectUrl(self: *OauthService, redirect_uri: []const u8, scope: []const u8, state: []const u8) WxResult([]const u8) {
+        const gpa = self.svc.gpa;
+        const enc = switch (pctEncode(gpa, redirect_uri)) {
+            .ok => |u| u,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(enc);
+        return switch (urlOf(gpa, open_host_url ++ "/connect/qrconnect?appid={s}&redirect_uri={s}&response_type=code&scope={s}&state={s}#wechat_redirect", .{ self.svc.config.appid(), enc, scope, state })) {
+            .ok => |u| .{ .ok = u },
+            .err => |e| .{ .err = e },
+        };
+    }
+
     /// 对应 `getAccessToken(code)`:用配置里的 appid/secret 换 code。
     pub fn getAccessToken(self: *OauthService, io: std.Io, code: []const u8) WxResult(OauthAccessToken) {
         const gpa = self.svc.gpa;
@@ -264,6 +282,19 @@ test "oauth: authorize url + access token + userinfo" {
                 try testing.expect(std.mem.indexOf(u8, u, "https://open.weixin.qq.com/connect/oauth2/authorize?appid=wxAPP&") != null);
                 try testing.expect(std.mem.indexOf(u8, u, "redirect_uri=https%3A%2F%2Fa.b%2Fcb%3Fx%3D1&response_type=code") != null);
                 try testing.expect(std.mem.indexOf(u8, u, "scope=snsapi_userinfo&state=s1&connect_redirect=1#wechat_redirect") != null);
+            },
+            .err => return error.Unexpected,
+        }
+    }
+
+    // 扫码登录 url(BaseWxMpServiceImpl#buildQrConnectUrl → QRCONNECT_URL)
+    {
+        const r = oauth.buildQrConnectUrl("https://a.b/cb?x=1", "snsapi_login", "s2");
+        switch (r) {
+            .ok => |u| {
+                defer gpa.free(@constCast(u));
+                try testing.expect(std.mem.indexOf(u8, u, "https://open.weixin.qq.com/connect/qrconnect?appid=wxAPP&") != null);
+                try testing.expect(std.mem.indexOf(u8, u, "redirect_uri=https%3A%2F%2Fa.b%2Fcb%3Fx%3D1&response_type=code&scope=snsapi_login&state=s2#wechat_redirect") != null);
             },
             .err => return error.Unexpected,
         }

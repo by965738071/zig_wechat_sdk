@@ -43,6 +43,26 @@ pub fn apiPost(svc: *service_mod.Service, io: std.Io, path: []const u8, body: []
     return svc.post(io, uri, &.{}, body);
 }
 
+/// 用 params 逐个填充 path 中的 `%s` 模板(对应 Java `String.format(url, ..)`)。
+/// api_url 常量为逐字保留 Java 原文的 `%s`,而 Zig 的 fmt 语法是 `{s}`,故手工替换。
+pub fn fillPath(gpa: std.mem.Allocator, comptime path: []const u8, params: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    var pi: usize = 0;
+    while (i < path.len) {
+        if (i + 1 < path.len and path[i] == '%' and path[i + 1] == 's') {
+            try out.appendSlice(gpa, params[pi]);
+            pi += 1;
+            i += 2;
+        } else {
+            try out.append(gpa, path[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// POST 且只关心 errcode:成功即完成(errcode!=0 已在 Service.executeInternal 折叠为 .err)。
 pub fn postVoid(svc: *service_mod.Service, io: std.Io, path: []const u8, body: []const u8) Done {
     const resp = switch (apiPost(svc, io, path, body)) {
@@ -147,7 +167,13 @@ pub fn strArrayValue(a: std.mem.Allocator, items: []const []const u8) !json_util
 // 离线契约测试脚手架(记录型 executor + 配置,逐字对齐 user.zig 的 URecorder)
 // ---------------------------------------------------------------------------
 
-pub const Entry = struct { match: []const u8, response: []const u8 };
+pub const Entry = struct {
+    /// URI 子串匹配。
+    match: []const u8,
+    /// 可选:同时要求请求体含此子串(同一 URI 不同请求体的分页场景)。
+    body_match: ?[]const u8 = null,
+    response: []const u8,
+};
 
 pub const Recorder = struct {
     entries: []const Entry,
@@ -180,6 +206,9 @@ pub const Recorder = struct {
         @memcpy(self.last_body[0..self.last_body_len], b[0..self.last_body_len]);
         for (self.entries) |e| {
             if (std.mem.indexOf(u8, target, e.match) != null) {
+                if (e.body_match) |bm| {
+                    if (std.mem.indexOf(u8, b, bm) == null) continue;
+                }
                 return .{ .ok = gpa.dupe(u8, e.response) catch
                     return .{ .err = u_error.WxError.transport(gpa, "oom", .{}) } };
             }

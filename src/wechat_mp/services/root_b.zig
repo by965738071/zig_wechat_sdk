@@ -8,7 +8,10 @@ pub const kefu = @import("kefu.zig");
 pub const mass = @import("mass.zig");
 pub const material = @import("material.zig");
 pub const media = @import("media.zig");
+pub const member_card = @import("member_card.zig");
+pub const store = @import("store.zig");
 pub const template_msg = @import("template_msg.zig");
+pub const wifi = @import("wifi.zig");
 
 test {
     _ = template_msg;
@@ -20,4 +23,7 @@ test {
     _ = draft;
     _ = free_publish;
     _ = card;
+    _ = member_card;
+    _ = store;
+    _ = wifi;
 }

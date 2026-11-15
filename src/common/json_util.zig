@@ -32,6 +32,17 @@ pub fn objectOf(root: Value, key: []const u8) ?ObjectMap {
     return object(child);
 }
 
+/// 按 key 取子对象的 `Value`(与 `objectOf` 的区别:保留任意 JSON 值形态,
+/// 便于继续链式 `getStr`/`getArray`/`getObject`;`data` 剥壳场景常用)。
+pub fn getObject(v: Value, key: []const u8) ?Value {
+    const o = object(v) orelse return null;
+    const child = o.get(key) orelse return null;
+    return switch (child) {
+        .object => child,
+        else => null,
+    };
+}
+
 /// 对应 `GsonHelper.getAsString(obj, key)`；非字符串返回 null。
 pub fn getStr(v: Value, key: []const u8) ?[]const u8 {
     const o = object(v) orelse return null;

@@ -1,13 +1,15 @@
 //! 临时素材 + 新增永久图文素材服务 —— 对应微信公众平台「素材管理」接口。
 //!
-//! 收录:临时素材(media/upload | media/get | media/uploadimg)与新增永久图文
-//! 素材(material/add_news)。multipart 组包复用 `material.zig` 的公开纯函数
-//! `buildMultipartBody` / `multipartContentType`(字段名 `media`、Content-Type、
-//! 边界格式逐字一致),不重复实现,与永久素材上传走同一条链路。
+//! 收录:临时素材(media/upload | media/get | media/get/jssdk | media/uploadimg)
+//! 与新增永久图文素材(material/add_news)。multipart 组包复用 `material.zig`
+//! 的公开纯函数 `buildMultipartBody` / `multipartContentType`(字段名 `media`、
+//! Content-Type、边界格式逐字一致),不重复实现,与永久素材上传走同一条链路。
 //!
 //! URL 以微信公众平台官方文档为准(路径由 `api_host_url` 拼前缀):
 //! - 新增临时素材   POST cgi-bin/media/upload?type=<type>  (multipart 字段 media)
 //! - 获取临时素材   GET  cgi-bin/media/get?media_id=<id>   (二进制流 或 JSON 错误)
+//! - JSSDK 素材下载 GET  cgi-bin/media/get/jssdk?media_id=<id>(同上,对应 Java
+//!   `WxMpMaterialServiceImpl#jssdkMediaDownload`)
 //! - 上传图文正文图 POST cgi-bin/media/uploadimg            (multipart,返回 url)
 //! - 新增永久图文   POST cgi-bin/material/add_news          (JSON: articles[])
 //! 注:`get_materialcount` / `batchget_material` 已在 `material.zig` 实现
@@ -32,6 +34,8 @@ const material = @import("material.zig");
 pub const Path = struct {
     pub const media_upload = "cgi-bin/media/upload";
     pub const media_get = "cgi-bin/media/get";
+    /// Java `JSSDK_MEDIA_GET_URL`。
+    pub const jssdk_media_get = "cgi-bin/media/get/jssdk";
     pub const media_uploadimg = "cgi-bin/media/uploadimg";
     pub const add_news = "cgi-bin/material/add_news";
 };
@@ -226,6 +230,23 @@ pub const MediaService = struct {
         return .{ .ok = resp };
     }
 
+    /// 对应 `WxMpMaterialServiceImpl#jssdkMediaDownload`(impl:68-74):
+    /// GET cgi-bin/media/get/jssdk?media_id=<id> —— 与 `mediaGet` 同构,
+    /// 二进制流透传 / JSON 错误折叠。
+    pub fn jssdkMediaGet(self: *MediaService, io: std.Io, media_id: []const u8) WxResult([]u8) {
+        const gpa = self.svc.gpa;
+        const qs = [_]service_mod.Query{.{ .key = "media_id", .value = media_id }};
+        const resp = switch (apiGet(self.svc, io, Path.jssdk_media_get, &qs)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        if (wxErrorFromBody(gpa, resp)) |we| {
+            gpa.free(resp);
+            return .{ .err = we };
+        }
+        return .{ .ok = resp };
+    }
+
     /// 对应「上传图文消息内的图片」:POST cgi-bin/media/uploadimg + multipart,
     /// 返回 `url`(用于图文正文,不是 media_id)。
     pub fn mediaUploadImg(self: *MediaService, io: std.Io, filename: []const u8, content: []const u8) WxResult(UploadImgResult) {
@@ -282,7 +303,7 @@ pub const MediaService = struct {
             return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
         defer gpa.free(boundary);
 
-        const body = material.buildMultipartBody(gpa, boundary, filename, content, null) catch |e|
+        const body = material.buildMultipartBody(gpa, boundary, "media", filename, content, null) catch |e|
             return .{ .err = result_mod.WxError.internal(gpa, "multipart body: {s}", .{@errorName(e)}) };
         defer gpa.free(body);
 
@@ -541,4 +562,36 @@ test "media errcode!=0 折叠为 .err(media/upload)" {
             try testing.expectEqual(@as(i64, 40004), err.error_code);
         },
     }
+}
+
+test "jssdkMediaGet: 二进制透传 + jssdk 专用 URL" {
+    const gpa = testing.allocator;
+    var mock = Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "media/get/jssdk", .response = "JSSDK_BINARY" },
+    } };
+    var threaded: std.Io.Threaded = undefined;
+    var cfg: config_mod.InMemoryConfigStorage = undefined;
+    var base: service_mod.Service = undefined;
+    try setup(gpa, &mock, &threaded, &cfg, &base);
+    defer threaded.deinit();
+    defer cfg.deinit();
+    var svc = MediaService{ .svc = &base };
+    const io = threaded.io();
+
+    switch (svc.jssdkMediaGet(io, "JID1")) {
+        .ok => |bytes| {
+            defer gpa.free(bytes);
+            try testing.expectEqualStrings("JSSDK_BINARY", bytes);
+        },
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.Unexpected;
+        },
+    }
+    try testing.expectEqualStrings("get", mock.last_method);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/media/get/jssdk") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "media_id=JID1") != null);
+    // 不误命中普通 media/get(URI 中 get 后跟 /jssdk)
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "get/jssdk") != null);
 }

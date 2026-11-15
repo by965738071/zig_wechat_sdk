@@ -8,14 +8,84 @@ pub const config = @import("config.zig");
 pub const http = @import("http.zig");
 pub const service = @import("service.zig");
 pub const router = @import("router.zig");
+// 35 个子服务(对应 Java WxMpServiceImpl 的子服务字段,eager 创建;
+// oauth 拆分、kf_session、jssdk 等为合理拆分后的 Zig 侧命名)
 pub const user = @import("services/user.zig");
+pub const menu = @import("services/menu.zig");
+pub const user_tag = @import("services/user_tag.zig");
+pub const qrcode = @import("services/qrcode.zig");
+pub const oauth = @import("services/oauth.zig");
+pub const jssdk = @import("services/jssdk.zig");
+pub const kf_session = @import("services/kf_session.zig");
+pub const subscribe_msg = @import("services/subscribe_msg.zig");
+pub const comment = @import("services/comment.zig");
+pub const user_blacklist = @import("services/user_blacklist.zig");
+pub const guide = @import("services/guide.zig");
+pub const guide_buyer = @import("services/guide_buyer.zig");
+pub const guide_tag = @import("services/guide_tag.zig");
+pub const guide_massed_job = @import("services/guide_massed_job.zig");
+pub const invoice = @import("services/invoice.zig");
+pub const reimburse = @import("services/reimburse.zig");
+pub const template_msg = @import("services/template_msg.zig");
+pub const kefu = @import("services/kefu.zig");
+pub const material = @import("services/material.zig");
+pub const mass = @import("services/mass.zig");
+pub const datacube = @import("services/datacube.zig");
+pub const media = @import("services/media.zig");
+pub const draft = @import("services/draft.zig");
+pub const free_publish = @import("services/free_publish.zig");
+pub const card = @import("services/card.zig");
+pub const ai_open = @import("services/ai_open.zig");
+pub const device = @import("services/device.zig");
+pub const guide_material = @import("services/guide_material.zig");
+pub const marketing = @import("services/marketing.zig");
+pub const shake = @import("services/shake.zig");
+pub const member_card = @import("services/member_card.zig");
+pub const store = @import("services/store.zig");
+pub const wifi = @import("services/wifi.zig");
+pub const ocr = @import("services/ocr.zig");
+pub const imgproc = @import("services/imgproc.zig");
 
 pub const MpService = struct {
     base: service.Service,
-    /// 子服务(骨架示例 UserService;其余同构追加即可)
+    /// 子服务(对应 Java WxMpServiceImpl 的同名字段,持 `&base` 反向引用)
     user_service: user.UserService,
+    menu_service: menu.MenuService,
+    user_tag_service: user_tag.UserTagService,
+    qrcode_service: qrcode.QrcodeService,
+    oauth_service: oauth.OauthService,
+    jssdk_service: jssdk.JssdkService,
+    kf_session_service: kf_session.KfSessionService,
+    subscribe_msg_service: subscribe_msg.SubscribeMsgService,
+    comment_service: comment.CommentService,
+    user_blacklist_service: user_blacklist.UserBlacklistService,
+    guide_service: guide.GuideService,
+    guide_buyer_service: guide_buyer.GuideBuyerService,
+    guide_tag_service: guide_tag.GuideTagService,
+    guide_massed_job_service: guide_massed_job.GuideMassedJobService,
+    invoice_service: invoice.InvoiceService,
+    reimburse_service: reimburse.ReimburseService,
+    template_msg_service: template_msg.TemplateMsgService,
+    kefu_service: kefu.KefuService,
+    material_service: material.MaterialService,
+    mass_service: mass.MassService,
+    data_cube_service: datacube.DataCubeService,
+    media_service: media.MediaService,
+    draft_service: draft.DraftService,
+    free_publish_service: free_publish.FreePublishService,
+    card_service: card.CardService,
+    ai_open_service: ai_open.AiOpenService,
+    device_service: device.DeviceService,
+    guide_material_service: guide_material.GuideMaterialService,
+    marketing_service: marketing.MarketingService,
+    shake_service: shake.ShakeService,
+    member_card_service: member_card.MemberCardService,
+    store_service: store.StoreService,
+    wifi_service: wifi.WifiService,
+    ocr_service: ocr.OcrService,
+    imgproc_service: imgproc.ImgProcService,
 
-    /// 对应 `new WxMpServiceImpl()`:注入配置与执行器,原地组合子服务。
+    /// 对应 `new WxMpServiceImpl()`:注入配置与执行器,原地组合全部 35 个子服务。
     /// 子服务持 `&self.base` 反向引用,初始化后不得移动本结构。
     /// 用法:
     /// ```zig
@@ -27,8 +97,76 @@ pub const MpService = struct {
         self.* = .{
             .base = service.Service.init(gpa, cfg, exec),
             .user_service = undefined,
+            .menu_service = undefined,
+            .user_tag_service = undefined,
+            .qrcode_service = undefined,
+            .oauth_service = undefined,
+            .jssdk_service = undefined,
+            .kf_session_service = undefined,
+            .subscribe_msg_service = undefined,
+            .comment_service = undefined,
+            .user_blacklist_service = undefined,
+            .guide_service = undefined,
+            .guide_buyer_service = undefined,
+            .guide_tag_service = undefined,
+            .guide_massed_job_service = undefined,
+            .invoice_service = undefined,
+            .reimburse_service = undefined,
+            .template_msg_service = undefined,
+            .kefu_service = undefined,
+            .material_service = undefined,
+            .mass_service = undefined,
+            .data_cube_service = undefined,
+            .media_service = undefined,
+            .draft_service = undefined,
+            .free_publish_service = undefined,
+            .card_service = undefined,
+            .ai_open_service = undefined,
+            .device_service = undefined,
+            .guide_material_service = undefined,
+            .marketing_service = undefined,
+            .shake_service = undefined,
+            .member_card_service = undefined,
+            .store_service = undefined,
+            .wifi_service = undefined,
+            .ocr_service = undefined,
+            .imgproc_service = undefined,
         };
         self.user_service = .{ .svc = &self.base };
+        self.menu_service = .{ .svc = &self.base };
+        self.user_tag_service = .{ .svc = &self.base };
+        self.qrcode_service = .{ .svc = &self.base };
+        self.oauth_service = .{ .svc = &self.base };
+        self.jssdk_service = .{ .svc = &self.base };
+        self.kf_session_service = .{ .svc = &self.base };
+        self.subscribe_msg_service = .{ .svc = &self.base };
+        self.comment_service = .{ .svc = &self.base };
+        self.user_blacklist_service = .{ .svc = &self.base };
+        self.guide_service = .{ .svc = &self.base };
+        self.guide_buyer_service = .{ .svc = &self.base };
+        self.guide_tag_service = .{ .svc = &self.base };
+        self.guide_massed_job_service = .{ .svc = &self.base };
+        self.invoice_service = .{ .svc = &self.base };
+        self.reimburse_service = .{ .svc = &self.base };
+        self.template_msg_service = .{ .svc = &self.base };
+        self.kefu_service = .{ .svc = &self.base };
+        self.material_service = .{ .svc = &self.base };
+        self.mass_service = .{ .svc = &self.base };
+        self.data_cube_service = .{ .svc = &self.base };
+        self.media_service = .{ .svc = &self.base };
+        self.draft_service = .{ .svc = &self.base };
+        self.free_publish_service = .{ .svc = &self.base };
+        self.card_service = .{ .svc = &self.base };
+        self.ai_open_service = .{ .svc = &self.base };
+        self.device_service = .{ .svc = &self.base };
+        self.guide_material_service = .{ .svc = &self.base };
+        self.marketing_service = .{ .svc = &self.base };
+        self.shake_service = .{ .svc = &self.base };
+        self.member_card_service = .{ .svc = &self.base };
+        self.store_service = .{ .svc = &self.base };
+        self.wifi_service = .{ .svc = &self.base };
+        self.ocr_service = .{ .svc = &self.base };
+        self.imgproc_service = .{ .svc = &self.base };
     }
 };
 
@@ -72,6 +210,39 @@ test "mp service full chain (stubbed)" {
             return error.Unexpected;
         },
     }
+}
+
+// 结构性验证:init 后全部子服务(32 个 *_service 字段)都指向同一个 base。
+test "MpService: all sub-services wired to base" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stub = http.StubExecutor.init(gpa, &.{});
+    var cfg = try config.InMemoryConfigStorage.init(gpa, undefined_fetcher, .{ .appid = "A", .secret = "S" });
+    defer cfg.deinit();
+    var tfetch = http.AccessTokenFetcher{
+        .cfg = cfg.config(),
+        .exec = stub.executor(),
+        .token_url = "https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential",
+    };
+    cfg.fetcher = tfetch.fetcher();
+
+    var mp: MpService = undefined;
+    mp.init(gpa, cfg.config(), stub.executor());
+    _ = io;
+
+    var wired: usize = 0;
+    const info = @typeInfo(MpService).@"struct";
+    inline for (info.field_names, info.field_types) |fname, ftype| {
+        if (comptime std.mem.endsWith(u8, fname, "_service")) {
+            const sub: *ftype = &@field(mp, fname);
+            try std.testing.expect(sub.svc == &mp.base);
+            wired += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 35), wired);
 }
 
 // access_token 错误码 → 自动刷新 → 重试一次(核心协议验证)。

@@ -23,6 +23,14 @@ pub const Path = struct {
     pub const delete_msg = "cgi-bin/message/mass/delete";
     /// `MESSAGE_MASS_GET_URL`:查询群发发送状态(`messageMassGet`)。
     pub const get = "cgi-bin/message/mass/get";
+    /// `MEDIA_UPLOAD_NEWS_URL`:群发图文素材上传(`massNewsUpload`)。
+    pub const upload_news = "cgi-bin/media/uploadnews";
+    /// `MEDIA_UPLOAD_VIDEO_URL`:群发视频素材上传(`massVideoUpload`)。
+    pub const upload_video = "cgi-bin/media/uploadvideo";
+    /// `MESSAGE_MASS_SPEED_GET_URL`:获取群发速度(`messageMassSpeedGet`)。
+    pub const speed_get = "cgi-bin/message/mass/speed/get";
+    /// `MESSAGE_MASS_SPEED_SET_URL`:设置群发速度(`messageMassSpeedSet`)。
+    pub const speed_set = "cgi-bin/message/mass/speed/set";
 };
 
 /// 群发消息载荷 —— tag 名即 msgtype(对齐 Java `WxConsts.MassMsgType`,
@@ -71,6 +79,59 @@ pub const MassSendResult = struct {
         errdefer r.deinit();
         r.msg_id = (try numOrStrDupe(gpa, v, "msg_id")) orelse "";
         r.msg_data_id = (try numOrStrDupe(gpa, v, "msg_data_id")) orelse "";
+        return r;
+    }
+};
+
+/// 素材上传结果 —— 对应 `bean.result.WxMpMassUploadResult`,解析键取自
+/// `util.json.WxMpMassUploadResultAdapter`(type/media_id/created_at 逐字)。
+/// 所有权:两字符串由 gpa 复制,用毕 `deinit`。
+pub const MassUploadResult = struct {
+    gpa: std.mem.Allocator,
+    type: []const u8 = "",
+    media_id: []const u8 = "",
+    created_at: i64 = 0,
+
+    pub fn deinit(self: *MassUploadResult) void {
+        const g = self.gpa;
+        if (self.type.len != 0) g.free(@constCast(self.type));
+        if (self.media_id.len != 0) g.free(@constCast(self.media_id));
+    }
+
+    fn fromJson(gpa: std.mem.Allocator, v: json_util.Value) !MassUploadResult {
+        var r = MassUploadResult{ .gpa = gpa };
+        errdefer r.deinit();
+        r.type = if (json_util.getStr(v, "type")) |s| try gpa.dupe(u8, s) else "";
+        r.media_id = if (json_util.getStr(v, "media_id")) |s| try gpa.dupe(u8, s) else "";
+        r.created_at = json_util.getInt(v, "created_at") orelse 0;
+        return r;
+    }
+};
+
+/// 群发速度 —— 对应 `bean.result.WxMpMassSpeedGetResult`(speed/realspeed,
+/// Java Integer;缺失按 0 承接)。
+pub const SpeedGetResult = struct {
+    speed: i64 = 0,
+    realspeed: i64 = 0,
+};
+
+/// 群发状态 —— 对应 `bean.result.WxMpMassGetResult`(msg_id/msg_status,
+/// @SerializedName 逐字)。所有权:msg_status 由 gpa 复制,用毕 `deinit`。
+pub const MassGetResult = struct {
+    gpa: std.mem.Allocator,
+    msg_id: i64 = 0,
+    msg_status: []const u8 = "",
+
+    pub fn deinit(self: *MassGetResult) void {
+        const g = self.gpa;
+        if (self.msg_status.len != 0) g.free(@constCast(self.msg_status));
+    }
+
+    fn fromJson(gpa: std.mem.Allocator, v: json_util.Value) !MassGetResult {
+        var r = MassGetResult{ .gpa = gpa };
+        errdefer r.deinit();
+        r.msg_id = json_util.getInt(v, "msg_id") orelse 0;
+        r.msg_status = if (json_util.getStr(v, "msg_status")) |s| try gpa.dupe(u8, s) else "";
         return r;
     }
 };
@@ -170,6 +231,97 @@ fn previewBody(gpa: std.mem.Allocator, touser: ?[]const u8, towxname: ?[]const u
         try w.writeByte(',');
     }
     try writeContent(w, c);
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+/// 群发图文文章 —— 对应 `bean.material.WxMpNewsArticle`,序列化逐字对齐
+/// `util.json.WxMpNewsArticleGsonAdapter`:thumb_media_id/thumb_url/title/content
+/// 恒发(thumb_url 为 null 时发 JSON null,同 adapter 的 addProperty 语义);
+/// author/content_source_url/digest/url/need_open_comment/only_fans_can_comment
+/// 为 null 时省略;show_cover_pic 恒发且为**字符串** "1"/"0"。
+pub const NewsArticle = struct {
+    thumb_media_id: []const u8,
+    thumb_url: ?[]const u8 = null,
+    title: []const u8,
+    content: []const u8,
+    author: ?[]const u8 = null,
+    content_source_url: ?[]const u8 = null,
+    digest: ?[]const u8 = null,
+    show_cover_pic: bool = false,
+    url: ?[]const u8 = null,
+    need_open_comment: ?bool = null,
+    only_fans_can_comment: ?bool = null,
+};
+
+/// 单篇文章 → JSON(字段序与 WxMpNewsArticleGsonAdapter.serialize 一致)。
+fn writeArticle(w: *std.Io.Writer, a: NewsArticle) std.Io.Writer.Error!void {
+    try w.writeAll("{\"thumb_media_id\":");
+    try jw.str(w, a.thumb_media_id);
+    try w.writeAll(",\"thumb_url\":");
+    if (a.thumb_url) |u| {
+        try jw.str(w, u);
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"title\":");
+    try jw.str(w, a.title);
+    try w.writeAll(",\"content\":");
+    try jw.str(w, a.content);
+    if (a.author) |v| {
+        try w.writeAll(",\"author\":");
+        try jw.str(w, v);
+    }
+    if (a.content_source_url) |v| {
+        try w.writeAll(",\"content_source_url\":");
+        try jw.str(w, v);
+    }
+    if (a.digest) |v| {
+        try w.writeAll(",\"digest\":");
+        try jw.str(w, v);
+    }
+    try w.writeAll(",\"show_cover_pic\":");
+    try w.writeAll(if (a.show_cover_pic) "\"1\"" else "\"0\"");
+    if (a.url) |v| {
+        try w.writeAll(",\"url\":");
+        try jw.str(w, v);
+    }
+    if (a.need_open_comment) |b| {
+        try w.print(",\"need_open_comment\":{d}", .{@as(i64, if (b) 1 else 0)});
+    }
+    if (a.only_fans_can_comment) |b| {
+        try w.print(",\"only_fans_can_comment\":{d}", .{@as(i64, if (b) 1 else 0)});
+    }
+    try w.writeByte('}');
+}
+
+/// massNewsUpload 请求体 —— 对齐 `WxMpMassNewsGsonAdapter`:
+/// `{"articles":[<WxMpNewsArticle>...]}`。
+fn newsBody(gpa: std.mem.Allocator, articles: []const NewsArticle) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"articles\":[");
+    for (articles, 0..) |a, i| {
+        if (i != 0) try w.writeByte(',');
+        try writeArticle(w, a);
+    }
+    try w.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+/// massVideoUpload 请求体 —— 对齐 `WxMpMassVideoAdapter`:
+/// `{"media_id":..,"description":..,"title":..}`(字段序同 adapter)。
+fn videoBody(gpa: std.mem.Allocator, media_id: []const u8, title: []const u8, description: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"media_id\":");
+    try jw.str(w, media_id);
+    try w.writeAll(",\"description\":");
+    try jw.str(w, description);
+    try w.writeAll(",\"title\":");
+    try jw.str(w, title);
     try w.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -277,10 +429,10 @@ pub const MassService = struct {
         return postVoid(self.svc, io, Path.delete_msg, body);
     }
 
-    /// 对应 `WxMpMassMessageServiceImpl#messageMassGet(msgId)`:
+    /// 扩展方法(Java 无对应;Java 的 messageMassGet 见 massGet):
     /// POST cgi-bin/message/mass/get {msg_id} → 群发进度 `current_rate`
     /// (官方响应形如 {"is_progress_exist":1,"progress":{"current_rate":100}},
-    /// 顶层/嵌套两种位置都兼容取值;缺失时按 Java 宽松语义返回 0)。
+    /// 顶层/嵌套两种位置都兼容取值;缺失时按宽松语义返回 0)。
     pub fn getUploadRate(self: *MassService, io: std.Io, msg_id: i64) WxResult(i64) {
         const gpa = self.svc.gpa;
         var ob = json_util.ObjectBuilder.init(gpa);
@@ -306,6 +458,110 @@ pub const MassService = struct {
             if (json_util.getInt(v, "current_rate")) |r| return .{ .ok = r };
         }
         return .{ .ok = 0 };
+    }
+
+    /// 对应 `massNewsUpload(WxMpMassNews)`(impl:36-39):
+    /// POST cgi-bin/media/uploadnews,body 由 WxMpMassNewsGsonAdapter 序列化
+    /// `{"articles":[...]}`,文章字段序见 NewsArticle。
+    pub fn newsUpload(self: *MassService, io: std.Io, articles: []const NewsArticle) WxResult(MassUploadResult) {
+        const gpa = self.svc.gpa;
+        const body = newsBody(gpa, articles) catch
+            return .{ .err = result_mod.WxError.internal(gpa, "build mass uploadnews body", .{}) };
+        defer gpa.free(body);
+
+        const resp = switch (apiPost(self.svc, io, Path.upload_news, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch return .{
+            .err = result_mod.WxError.transport(gpa, "mass uploadnews not json", .{}),
+        };
+        defer parsed.deinit();
+        const r = MassUploadResult.fromJson(gpa, parsed.value) catch
+            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        return .{ .ok = r };
+    }
+
+    /// 对应 `massVideoUpload(WxMpMassVideo)`(impl:41-44):
+    /// POST cgi-bin/media/uploadvideo,body 见 videoBody(WxMpMassVideoAdapter)。
+    pub fn videoUpload(self: *MassService, io: std.Io, media_id: []const u8, title: []const u8, description: []const u8) WxResult(MassUploadResult) {
+        const gpa = self.svc.gpa;
+        const body = videoBody(gpa, media_id, title, description) catch
+            return .{ .err = result_mod.WxError.internal(gpa, "build mass uploadvideo body", .{}) };
+        defer gpa.free(body);
+
+        const resp = switch (apiPost(self.svc, io, Path.upload_video, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch return .{
+            .err = result_mod.WxError.transport(gpa, "mass uploadvideo not json", .{}),
+        };
+        defer parsed.deinit();
+        const r = MassUploadResult.fromJson(gpa, parsed.value) catch
+            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        return .{ .ok = r };
+    }
+
+    /// 对应 `messageMassSpeedGet()`(impl:70-76):建空 JsonObject 后 POST
+    /// speed/get(即 body "{}")→ WxMpMassSpeedGetResult{speed,realspeed}。
+    pub fn speedGet(self: *MassService, io: std.Io) WxResult(SpeedGetResult) {
+        const gpa = self.svc.gpa;
+        const resp = switch (apiPost(self.svc, io, Path.speed_get, "{}")) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch return .{
+            .err = result_mod.WxError.transport(gpa, "mass speed get not json", .{}),
+        };
+        defer parsed.deinit();
+        return .{ .ok = .{
+            .speed = json_util.getInt(parsed.value, "speed") orelse 0,
+            .realspeed = json_util.getInt(parsed.value, "realspeed") orelse 0,
+        } };
+    }
+
+    /// 对应 `messageMassSpeedSet(speed)`(impl:78-83):
+    /// POST speed/set,body `{"speed":N}`。
+    pub fn speedSet(self: *MassService, io: std.Io, speed: i64) Done {
+        const gpa = self.svc.gpa;
+        var ob = json_util.ObjectBuilder.init(gpa);
+        defer ob.deinit();
+        const body = build: {
+            ob.putInt("speed", speed) catch break :build null;
+            break :build ob.toJson() catch null;
+        } orelse return .{ .err = result_mod.WxError.internal(gpa, "build mass speed set body", .{}) };
+        defer gpa.free(body);
+        return postVoid(self.svc, io, Path.speed_set, body);
+    }
+
+    /// 对应 `messageMassGet(msgId)`(impl:95-102):POST mass/get `{"msg_id":N}`
+    /// → WxMpMassGetResult{msg_id,msg_status}。
+    pub fn massGet(self: *MassService, io: std.Io, msg_id: i64) WxResult(MassGetResult) {
+        const gpa = self.svc.gpa;
+        var ob = json_util.ObjectBuilder.init(gpa);
+        defer ob.deinit();
+        const body = build: {
+            ob.putInt("msg_id", msg_id) catch break :build null;
+            break :build ob.toJson() catch null;
+        } orelse return .{ .err = result_mod.WxError.internal(gpa, "build mass get body", .{}) };
+        defer gpa.free(body);
+
+        const resp = switch (apiPost(self.svc, io, Path.get, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch return .{
+            .err = result_mod.WxError.transport(gpa, "mass get not json", .{}),
+        };
+        defer parsed.deinit();
+        const r = MassGetResult.fromJson(gpa, parsed.value) catch
+            return .{ .err = result_mod.WxError.internal(gpa, "oom", .{}) };
+        return .{ .ok = r };
     }
 };
 
@@ -558,4 +814,122 @@ test "mass get_upload_rate 解析 + errcode!=0" {
             try testing.expectEqual(@as(i64, 45009), err.error_code);
         },
     }
+}
+
+test "mass newsUpload/videoUpload/speedGet/speedSet/massGet 契约" {
+    const gpa = testing.allocator;
+    var mock = Recorder{ .gpa = gpa, .entries = &.{
+        .{ .match = "uploadnews", .response = "{\"errcode\":0,\"type\":\"news\",\"media_id\":\"CSN1\",\"created_at\":1395462616}" },
+        .{ .match = "uploadvideo", .response = "{\"errcode\":0,\"type\":\"video\",\"media_id\":\"CSV1\",\"created_at\":1395462617}" },
+        .{ .match = "speed/get", .response = "{\"errcode\":0,\"speed\":30,\"realspeed\":25}" },
+        .{ .match = "speed/set", .response = "{\"errcode\":0,\"errmsg\":\"ok\"}" },
+        .{ .match = "mass/get", .response = "{\"errcode\":0,\"msg_id\":12345,\"msg_status\":\"SEND_SUCCESS\"}" },
+    } };
+    var threaded: std.Io.Threaded = undefined;
+    var cfg: config_mod.InMemoryConfigStorage = undefined;
+    var base: service_mod.Service = undefined;
+    try setup(gpa, &mock, &threaded, &cfg, &base);
+    defer threaded.deinit();
+    defer cfg.deinit();
+    var svc = MassService{ .svc = &base };
+    const io = threaded.io();
+
+    // 1 massNewsUpload:字段序/恒发与可选省略对齐 WxMpNewsArticleGsonAdapter
+    switch (svc.newsUpload(io, &.{
+        .{
+            .thumb_media_id = "T1",
+            .thumb_url = "https://t/1",
+            .title = "标题",
+            .content = "内容",
+            .author = "作者",
+            .content_source_url = "https://s",
+            .digest = "摘要",
+            .show_cover_pic = true,
+            .url = "https://u",
+            .need_open_comment = true,
+            .only_fans_can_comment = false,
+        },
+        .{ .thumb_media_id = "T2", .title = "T", .content = "C" },
+    })) {
+        .ok => |*v| {
+            var res = v.*;
+            defer res.deinit();
+            try testing.expectEqualStrings("news", res.type);
+            try testing.expectEqualStrings("CSN1", res.media_id);
+            try testing.expectEqual(@as(i64, 1395462616), res.created_at);
+        },
+        .err => |*e| {
+            var err = e.*;
+            defer err.deinit();
+            return error.Unexpected;
+        },
+    }
+    try testing.expectEqualStrings("post", mock.last_method);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/media/uploadnews") != null);
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "access_token=TOK") != null);
+    {
+        const b = mock.body();
+        try testing.expect(std.mem.startsWith(u8, b, "{\"articles\":["));
+        try testing.expect(std.mem.indexOf(u8, b, "\"thumb_media_id\":\"T1\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"thumb_url\":\"https://t/1\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"title\":\"标题\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"content\":\"内容\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"author\":\"作者\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"content_source_url\":\"https://s\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"digest\":\"摘要\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"show_cover_pic\":\"1\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"url\":\"https://u\"") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"need_open_comment\":1") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"only_fans_can_comment\":0") != null);
+        // 第二篇:最小字段 —— thumb_url 恒发为 null,show_cover_pic 恒发 "0",可选项全省略
+        try testing.expect(std.mem.indexOf(u8, b, "\"thumb_url\":null") != null);
+        try testing.expect(std.mem.indexOf(u8, b, "\"show_cover_pic\":\"0\"") != null);
+        try testing.expect(std.mem.endsWith(u8, b, "]}"));
+    }
+
+    // 2 massVideoUpload:字段序 media_id/description/title(WxMpMassVideoAdapter)
+    switch (svc.videoUpload(io, "MID", "标题D", "描述")) {
+        .ok => |*v| {
+            var res = v.*;
+            defer res.deinit();
+            try testing.expectEqualStrings("CSV1", res.media_id);
+        },
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/media/uploadvideo") != null);
+    try testing.expectEqualStrings("{\"media_id\":\"MID\",\"description\":\"描述\",\"title\":\"标题D\"}", mock.body());
+
+    // 3 messageMassSpeedGet:body "{}" → speed/realspeed
+    switch (svc.speedGet(io)) {
+        .ok => |r| {
+            try testing.expectEqual(@as(i64, 30), r.speed);
+            try testing.expectEqual(@as(i64, 25), r.realspeed);
+        },
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/message/mass/speed/get") != null);
+    try testing.expectEqualStrings("{}", mock.body());
+
+    // 4 messageMassSpeedSet:{"speed":N}
+    switch (svc.speedSet(io, 30)) {
+        .ok => {},
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/message/mass/speed/set") != null);
+    try testing.expectEqualStrings("{\"speed\":30}", mock.body());
+
+    // 5 messageMassGet:{"msg_id":N} → msg_id/msg_status
+    switch (svc.massGet(io, 12345)) {
+        .ok => |*v| {
+            var res = v.*;
+            defer res.deinit();
+            try testing.expectEqual(@as(i64, 12345), res.msg_id);
+            try testing.expectEqualStrings("SEND_SUCCESS", res.msg_status);
+        },
+        .err => return error.Unexpected,
+    }
+    try testing.expect(std.mem.indexOf(u8, mock.uri(), "cgi-bin/message/mass/get") != null);
+    try testing.expectEqualStrings("{\"msg_id\":12345}", mock.body());
+
+    try testing.expectEqual(@as(usize, 5), mock.calls);
 }

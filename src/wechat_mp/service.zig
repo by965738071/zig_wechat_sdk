@@ -54,6 +54,11 @@ pub const ApiUrl = enum {
     oauth_refresh_token,
     // 长链接转短链接(挂主接口 BaseWxMpServiceImpl.shortUrl)
     shorturl,
+    // 短 key 收发(挂主接口 BaseWxMpServiceImpl.genShorten/fetchShorten)
+    gen_shorten,
+    fetch_shorten,
+    // 语义理解(挂主接口 BaseWxMpServiceImpl.semanticQuery)
+    semantic_search,
     // 基础能力(对应 Java BaseWxMpServiceImpl 的 URL-only 方法)
     get_callback_ip, // getCallbackIP -> GET /cgi-bin/getcallbackip
     get_current_autoreply_info, // getCurrentAutoReplyInfo
@@ -148,11 +153,25 @@ pub const ApiUrl = enum {
     card_mpnews_gethtml,
     card_self_consume_cell_set,
     card_user_card_list,
-    // 电子发票 —— enums/WxMpApiUrl.Invoice,字段可逐字确定的子集(4)
+    // 电子发票(商家侧) —— enums/WxMpApiUrl.Invoice,16 常量中的 12 个
+    // (reimburse 4 个见下方 invoice_reimburse_*)
     invoice_query_info,
     invoice_get_contact,
     invoice_get_auth_field,
     invoice_get_pay_mch,
+    invoice_get_auth_url,
+    invoice_get_auth_data,
+    invoice_reject_insert,
+    invoice_make_out_invoice,
+    invoice_clear_out_invoice,
+    invoice_set_contact,
+    invoice_set_auth_field,
+    invoice_set_pay_mch,
+    // 电子发票(报销方) —— WxMpReimburseInvoiceService 的 4 端点
+    invoice_reimburse_get_info,
+    invoice_reimburse_get_batch,
+    invoice_reimburse_update_status,
+    invoice_reimburse_update_status_batch,
 
     pub fn asUri(self: ApiUrl) []const u8 {
         return switch (self) {
@@ -172,6 +191,10 @@ pub const ApiUrl = enum {
             .oauth_access_token => "sns/oauth2/access_token",
             .oauth_refresh_token => "sns/oauth2/refresh_token",
             .shorturl => "cgi-bin/shorturl",
+            // 逐字对照 WxMpApiUrl.java:147,172,177
+            .gen_shorten => "cgi-bin/shorten/gen",
+            .fetch_shorten => "cgi-bin/shorten/fetch",
+            .semantic_search => "semantic/semproxy/search",
             // 逐字对照 WxMpApiUrl.java 常量
             .get_callback_ip => "cgi-bin/getcallbackip",
             .get_current_autoreply_info => "cgi-bin/get_current_autoreply_info",
@@ -266,6 +289,18 @@ pub const ApiUrl = enum {
             .invoice_get_contact => "card/invoice/setbizattr?action=get_contact",
             .invoice_get_auth_field => "card/invoice/setbizattr?action=get_auth_field",
             .invoice_get_pay_mch => "card/invoice/setbizattr?action=get_pay_mch",
+            .invoice_get_auth_url => "card/invoice/getauthurl",
+            .invoice_get_auth_data => "card/invoice/getauthdata",
+            .invoice_reject_insert => "card/invoice/rejectinsert",
+            .invoice_make_out_invoice => "card/invoice/makeoutinvoice",
+            .invoice_clear_out_invoice => "card/invoice/clearoutinvoice",
+            .invoice_set_contact => "card/invoice/setbizattr?action=set_contact",
+            .invoice_set_auth_field => "card/invoice/setbizattr?action=set_auth_field",
+            .invoice_set_pay_mch => "card/invoice/setbizattr?action=set_pay_mch",
+            .invoice_reimburse_get_info => "card/invoice/reimburse/getinvoiceinfo",
+            .invoice_reimburse_get_batch => "card/invoice/reimburse/getinvoicebatch",
+            .invoice_reimburse_update_status => "card/invoice/reimburse/updateinvoicestatus",
+            .invoice_reimburse_update_status_batch => "card/invoice/reimburse/updatestatusbatch",
         };
     }
 };
@@ -305,8 +340,8 @@ fn buildUrl(gpa: std.mem.Allocator, base: []const u8, query: []const Query, acce
         const part = try std.fmt.allocPrint(gpa, "{c}{s}={s}", .{ sep, q.key, v });
         defer gpa.free(part);
         try out.appendSlice(gpa, part);
-        if(sep == '?') {
-             sep = '&';
+        if (sep == '?') {
+            sep = '&';
         }
     }
     if (access_token) |t| {
@@ -614,6 +649,206 @@ pub const Service = struct {
             return .{ .err = WxError.internal(self.gpa, "oom", .{}) } };
     }
 
+    /// 短 key 解析结果 —— 对应 `WxMpShortKeyResult`
+    /// (long_data/create_time/expire_seconds,字段 gpa 拥有,用毕 deinit)。
+    pub const ShortKeyResult = struct {
+        gpa: std.mem.Allocator,
+        long_data: []u8,
+        create_time: i64,
+        expire_seconds: i64,
+
+        pub fn deinit(self: *ShortKeyResult) void {
+            self.gpa.free(self.long_data);
+            self.* = undefined;
+        }
+    };
+
+    /// 生成短 key —— 对应 `#genShorten(longData, expireSeconds)`(impl:167-176):
+    /// POST cgi-bin/shorten/gen {"long_data","expire_seconds"},响应取 short_key。
+    /// 差异:Java Gson 对 null Integer 仍序列化出 "expire_seconds":null,
+    /// Zig 在 expire_seconds 为 null 时直接省略该字段(语义等价,报文更干净)。
+    /// 返回 gpa 拥有的 short_key,调用方 free。
+    pub fn genShorten(self: *Service, io: std.Io, long_data: []const u8, expire_seconds: ?i64) WxResult([]u8) {
+        var ob = json_util.ObjectBuilder.init(self.gpa);
+        defer ob.deinit();
+        ob.putStr("long_data", long_data) catch
+            return .{ .err = WxError.internal(self.gpa, "oom", .{}) };
+        if (expire_seconds) |es| {
+            ob.putInt("expire_seconds", es) catch
+                return .{ .err = WxError.internal(self.gpa, "oom", .{}) };
+        }
+        const body = ob.toJson() catch
+            return .{ .err = WxError.internal(self.gpa, "oom", .{}) };
+        defer self.gpa.free(body);
+
+        const resp = switch (self.apiPost(io, .gen_shorten, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer self.gpa.free(resp);
+        const parsed = json_util.parse(self.gpa, resp) catch
+            return .{ .err = WxError.transport(self.gpa, "shorten/gen response not json", .{}) };
+        defer parsed.deinit();
+        const key = json_util.getStr(parsed.value, "short_key") orelse
+            return .{ .err = WxError.transport(self.gpa, "shorten/gen response missing short_key", .{}) };
+        return .{ .ok = self.gpa.dupe(u8, key) catch
+            return .{ .err = WxError.internal(self.gpa, "oom", .{}) } };
+    }
+
+    /// 短 key 解析 —— 对应 `#fetchShorten(shortKey)`(impl:178-183):
+    /// POST cgi-bin/shorten/fetch {"short_key"} → WxMpShortKeyResult。
+    pub fn fetchShorten(self: *Service, io: std.Io, short_key: []const u8) WxResult(ShortKeyResult) {
+        const gpa = self.gpa;
+        var ob = json_util.ObjectBuilder.init(gpa);
+        defer ob.deinit();
+        ob.putStr("short_key", short_key) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        const body = ob.toJson() catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        defer gpa.free(body);
+
+        const resp = switch (self.apiPost(io, .fetch_shorten, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch
+            return .{ .err = WxError.transport(gpa, "shorten/fetch response not json", .{}) };
+        defer parsed.deinit();
+        const long_data = json_util.getStr(parsed.value, "long_data") orelse
+            return .{ .err = WxError.transport(gpa, "shorten/fetch response missing long_data", .{}) };
+        const ld = gpa.dupe(u8, long_data) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        return .{ .ok = .{
+            .gpa = gpa,
+            .long_data = ld,
+            .create_time = json_util.getIntOr(parsed.value, "create_time", 0),
+            .expire_seconds = json_util.getIntOr(parsed.value, "expire_seconds", 0),
+        } };
+    }
+
+    /// 语义理解查询 —— 对应 `WxMpSemanticQuery`(bean/WxMpSemanticQuery.java):
+    /// Gson 对 null 字段默认省略,故可选项为 null 时不发该字段。
+    pub const SemanticQuery = struct {
+        query: []const u8,
+        category: ?[]const u8 = null,
+        latitude: ?f64 = null,
+        longitude: ?f64 = null,
+        city: ?[]const u8 = null,
+        region: ?[]const u8 = null,
+        appid: ?[]const u8 = null,
+        uid: ?[]const u8 = null,
+    };
+
+    /// 语义理解结果 —— 对应 `WxMpSemanticQueryResult`。Java 里 semantic/result
+    /// 是 String,装的是该子元素 toString() 后的原始 JSON 串;Zig 同样把
+    /// object/array 子元素 stringify 成串,string 则直接拷贝。
+    /// 字段名 `type` 是 Zig 关键字,用 @"type"(Java 字段名逐字对齐)。
+    pub const SemanticQueryResult = struct {
+        gpa: std.mem.Allocator,
+        query: []u8,
+        type: []u8,
+        semantic: []u8,
+        result: []u8,
+        answer: []u8,
+        text: []u8,
+
+        pub fn deinit(self: *SemanticQueryResult) void {
+            const g = self.gpa;
+            g.free(self.query);
+            g.free(self.type);
+            g.free(self.semantic);
+            g.free(self.result);
+            g.free(self.answer);
+            g.free(self.text);
+            self.* = undefined;
+        }
+    };
+
+    /// 语义理解 —— 对应 `#semanticQuery(WxMpSemanticQuery)`(impl:327-331):
+    /// POST semantic/semproxy/search,请求体为查询对象 toJson。
+    pub fn semanticQuery(self: *Service, io: std.Io, q: SemanticQuery) WxResult(SemanticQueryResult) {
+        const gpa = self.gpa;
+        var ob = json_util.ObjectBuilder.init(gpa);
+        defer ob.deinit();
+        ob.putStr("query", q.query) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        if (q.category) |v| ob.putStr("category", v) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        if (q.latitude) |v| ob.putValue("latitude", .{ .float = v }) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        if (q.longitude) |v| ob.putValue("longitude", .{ .float = v }) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        if (q.city) |v| ob.putStr("city", v) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        if (q.region) |v| ob.putStr("region", v) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        if (q.appid) |v| ob.putStr("appid", v) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        if (q.uid) |v| ob.putStr("uid", v) catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        const body = ob.toJson() catch
+            return .{ .err = WxError.internal(gpa, "oom", .{}) };
+        defer gpa.free(body);
+
+        const resp = switch (self.apiPost(io, .semantic_search, body)) {
+            .ok => |b| b,
+            .err => |e| return .{ .err = e },
+        };
+        defer gpa.free(resp);
+        const parsed = json_util.parse(gpa, resp) catch
+            return .{ .err = WxError.transport(gpa, "semproxy response not json", .{}) };
+        defer parsed.deinit();
+        // 子元素 → 原始 JSON 串(object/array stringify;string 直接拷贝)。
+        // 先进 arena,全部字段凑齐后统一 dupe 到 gpa,缺字段/中途失败零泄漏。
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const raw = struct {
+            fn get(g: std.mem.Allocator, v: json_util.Value, key: []const u8) ![]u8 {
+                // getObject 返回 ?Value,直接 stringify(Value 有 jsonStringify);
+                // getArray 返回 ?ArrayList(Value) 裸载荷,须包回 Value 联合再序列化。
+                if (json_util.getObject(v, key)) |item|
+                    return json_util.stringify(g, item);
+                if (json_util.getArray(v, key)) |item|
+                    return json_util.stringify(g, json_util.Value{ .array = item });
+                if (json_util.getStr(v, key)) |item|
+                    return g.dupe(u8, item);
+                return error.missing;
+            }
+            fn str(g: std.mem.Allocator, v: json_util.Value, key: []const u8) ![]u8 {
+                return g.dupe(u8, json_util.getStr(v, key) orelse return error.missing);
+            }
+        };
+        const query = raw.str(a, parsed.value, "query") catch
+            return .{ .err = WxError.transport(gpa, "semproxy response missing query", .{}) };
+        const type_str = raw.str(a, parsed.value, "type") catch
+            return .{ .err = WxError.transport(gpa, "semproxy response missing type", .{}) };
+        const semantic = raw.get(a, parsed.value, "semantic") catch
+            return .{ .err = WxError.transport(gpa, "semproxy response missing semantic", .{}) };
+        const result = raw.get(a, parsed.value, "result") catch
+            return .{ .err = WxError.transport(gpa, "semproxy response missing result", .{}) };
+        const answer = raw.str(a, parsed.value, "answer") catch
+            return .{ .err = WxError.transport(gpa, "semproxy response missing answer", .{}) };
+        const text = raw.str(a, parsed.value, "text") catch
+            return .{ .err = WxError.transport(gpa, "semproxy response missing text", .{}) };
+        return .{ .ok = .{
+            .gpa = gpa,
+            .query = gpa.dupe(u8, query) catch
+                return .{ .err = WxError.internal(gpa, "oom", .{}) },
+            .type = gpa.dupe(u8, type_str) catch
+                return .{ .err = WxError.internal(gpa, "oom", .{}) },
+            .semantic = gpa.dupe(u8, semantic) catch
+                return .{ .err = WxError.internal(gpa, "oom", .{}) },
+            .result = gpa.dupe(u8, result) catch
+                return .{ .err = WxError.internal(gpa, "oom", .{}) },
+            .answer = gpa.dupe(u8, answer) catch
+                return .{ .err = WxError.internal(gpa, "oom", .{}) },
+            .text = gpa.dupe(u8, text) catch
+                return .{ .err = WxError.internal(gpa, "oom", .{}) },
+        } };
+    }
+
     // -----------------------------------------------------------------------
     // 基础能力:只拼 URL/参数、无需联调的子服务端点
     // (逐字对照 `WxMpApiUrl.java` 常量 + `BaseWxMpServiceImpl` 对应方法)。
@@ -872,6 +1107,101 @@ test "URL-only endpoints: getCallbackIP / clearQuota / netCheck / autoreply" {
     try testing.expect(std.mem.indexOf(u8, rec.uri(), "cgi-bin/callback/check") != null);
     try testing.expect(std.mem.indexOf(u8, rec.body(), "\"action\":\"dns\"") != null);
     try testing.expect(std.mem.indexOf(u8, rec.body(), "\"check_operator\":\"OPER\"") != null);
+}
+
+test "shorten gen/fetch + semanticQuery: 挂主接口的三组门面(BaseWxMpServiceImpl)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rec = SvcRecorder{ .gpa = gpa, .replies = &.{
+        .{ .match = "shorten/gen", .response = "{\"errcode\":0,\"short_key\":\"SK123\"}" },
+        .{ .match = "shorten/fetch", .response = "{\"errcode\":0,\"long_data\":\"https://long.example\",\"create_time\":1700000000,\"expire_seconds\":86400}" },
+        .{ .match = "semproxy/search", .response = "{\"errcode\":0,\"query\":\"附近美食\",\"type\":\"restaurant\",\"semantic\":{\"category\":\"美食\",\"details\":{}},\"result\":[{\"name\":\"A\"}],\"answer\":\"答案\",\"text\":\"t\"}" },
+    } };
+    defer rec.deinit();
+    var cfg = try mkCfg(gpa, false);
+    defer cfg.deinit();
+    var svc = Service.init(gpa, cfg.config(), rec.executor());
+
+    // genShorten:POST {"long_data","expire_seconds"}
+    switch (svc.genShorten(io, "https://long.example", 300)) {
+        .ok => |k| {
+            defer gpa.free(k);
+            try testing.expectEqualStrings("SK123", k);
+        },
+        .err => |e| {
+            var err = e;
+            defer err.deinit();
+            return error.UnexpectedGenShorten;
+        },
+    }
+    try testing.expectEqualStrings("post", rec.last_method);
+    try testing.expect(std.mem.indexOf(u8, rec.uri(), "cgi-bin/shorten/gen") != null);
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "\"long_data\":\"https://long.example\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "\"expire_seconds\":300") != null);
+
+    // expire_seconds=null → 省略字段(Java Gson 会发 "expire_seconds":null,见方法头注释)
+    switch (svc.genShorten(io, "https://long.example", null)) {
+        .ok => |k| gpa.free(k),
+        .err => |e| {
+            var err = e;
+            defer err.deinit();
+            return error.UnexpectedGenShortenNull;
+        },
+    }
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "expire_seconds") == null);
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "\"long_data\":") != null);
+
+    // fetchShorten → WxMpShortKeyResult
+    switch (svc.fetchShorten(io, "SK123")) {
+        .ok => |*r| {
+            var s = r.*;
+            defer s.deinit();
+            try testing.expectEqualStrings("https://long.example", s.long_data);
+            try testing.expectEqual(@as(i64, 1700000000), s.create_time);
+            try testing.expectEqual(@as(i64, 86400), s.expire_seconds);
+        },
+        .err => |e| {
+            var err = e;
+            defer err.deinit();
+            return error.UnexpectedFetchShorten;
+        },
+    }
+    try testing.expect(std.mem.indexOf(u8, rec.uri(), "cgi-bin/shorten/fetch") != null);
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "\"short_key\":\"SK123\"") != null);
+
+    // semanticQuery:object/array 子元素 stringify 成串(对应 Java 的 toString() 语义)
+    switch (svc.semanticQuery(io, .{
+        .query = "附近美食",
+        .category = "美食",
+        .latitude = 39.9,
+        .longitude = 116.4,
+        .city = "北京市",
+        .region = "东城区",
+        .appid = "wxAPP",
+        .uid = "U1",
+    })) {
+        .ok => |*r| {
+            var s = r.*;
+            defer s.deinit();
+            try testing.expectEqualStrings("附近美食", s.query);
+            try testing.expectEqualStrings("restaurant", s.type);
+            try testing.expectEqualStrings("{\"category\":\"美食\",\"details\":{}}", s.semantic);
+            try testing.expectEqualStrings("[{\"name\":\"A\"}]", s.result);
+            try testing.expectEqualStrings("答案", s.answer);
+        },
+        .err => |e| {
+            var err = e;
+            defer err.deinit();
+            return error.UnexpectedSemanticQuery;
+        },
+    }
+    try testing.expect(std.mem.indexOf(u8, rec.uri(), "semantic/semproxy/search") != null);
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "\"latitude\":39.9") != null);
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "\"longitude\":116.4") != null);
+    try testing.expect(std.mem.indexOf(u8, rec.body(), "\"uid\":\"U1\"") != null);
 }
 
 test "createJsapiSignature: SHA1.genWithAmple over ticket/noncestr/timestamp/url" {
