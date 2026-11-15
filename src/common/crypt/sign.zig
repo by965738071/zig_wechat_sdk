@@ -16,6 +16,15 @@ pub fn hmacSha256HexUpper(gpa: std.mem.Allocator, message: []const u8, key: []co
     return gpa.dupe(u8, &hx);
 }
 
+/// `SignUtils.createHmacSha256Sign` 的小写形式 —— 小程序 user 的 setUserStorage /
+/// checkSessionKey 取 `sign(...).toLowerCase()`（对应 Java 的 `.toLowerCase()`）。
+pub fn hmacSha256HexLower(gpa: std.mem.Allocator, message: []const u8, key: []const u8) ![]u8 {
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, message, key);
+    const hx = std.fmt.bytesToHex(mac, .lower);
+    return gpa.dupe(u8, &hx);
+}
+
 /// MD5 → hex 大写（V2 签名默认）。
 pub fn md5HexUpper(gpa: std.mem.Allocator, data: []const u8) ![]u8 {
     var digest: [16]u8 = undefined;

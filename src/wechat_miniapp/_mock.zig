@@ -72,3 +72,32 @@ pub fn fakeTokenConfig(gpa: std.mem.Allocator) !mp_config.InMemoryConfigStorage 
     };
     return mp_config.InMemoryConfigStorage.init(gpa, .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } }, .{ .appid = "MA", .secret = "MS" });
 }
+
+/// 带 jsapi ticket fetcher 的 fake 配置:token 返回 "TOK",ticket 返回 "JT"。
+pub fn fakeTokenConfigWithTicket(gpa: std.mem.Allocator) !mp_config.InMemoryConfigStorage {
+    const FakeFetch = struct {
+        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) token_mod.FetchOutcome {
+            _ = c;
+            _ = i;
+            const t = g.dupe(u8, "TOK") catch return .{ .err = error_mod.WxError.transport(g, "oom", .{}) };
+            return .{ .ok = .{ .token = t, .expires_in = 7200 } };
+        }
+    };
+    const FakeTicket = struct {
+        fn f(c: *anyopaque, g: std.mem.Allocator, i: std.Io) token_mod.FetchOutcome {
+            _ = c;
+            _ = i;
+            const t = g.dupe(u8, "JT") catch return .{ .err = error_mod.WxError.transport(g, "oom", .{}) };
+            return .{ .ok = .{ .token = t, .expires_in = 7200 } };
+        }
+    };
+    return mp_config.InMemoryConfigStorage.init(
+        gpa,
+        .{ .ptr = undefined, .vtable = &.{ .fetch = FakeFetch.f } },
+        .{
+            .appid = "MA",
+            .secret = "MS",
+            .ticket_fetcher = .{ .ptr = undefined, .vtable = &.{ .fetch = FakeTicket.f } },
+        },
+    );
+}
