@@ -12,6 +12,17 @@ pub const run = @import("run.zig");
 pub const share = @import("share.zig");
 pub const openapi = @import("openapi.zig");
 pub const analysis = @import("analysis.zig");
+pub const code = @import("code.zig");
+pub const setting = @import("setting.zig");
+pub const security = @import("security.zig");
+pub const plugin = @import("plugin.zig");
+pub const scheme = @import("scheme.zig");
+pub const kefu = @import("kefu.zig");
+pub const msg = @import("msg.zig");
+pub const marketing = @import("marketing.zig");
+pub const face = @import("face.zig");
+pub const device = @import("device.zig");
+pub const complaint = @import("complaint.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -28,4 +39,15 @@ test {
     _ = share;
     _ = openapi;
     _ = analysis;
+    _ = code;
+    _ = setting;
+    _ = security;
+    _ = plugin;
+    _ = scheme;
+    _ = kefu;
+    _ = msg;
+    _ = marketing;
+    _ = face;
+    _ = device;
+    _ = complaint;
 }
