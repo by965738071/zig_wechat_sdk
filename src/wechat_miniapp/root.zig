@@ -23,6 +23,16 @@ pub const marketing = @import("marketing.zig");
 pub const face = @import("face.zig");
 pub const device = @import("device.zig");
 pub const complaint = @import("complaint.zig");
+pub const media = @import("media.zig");
+pub const qrcode_jump = @import("qrcode_jump.zig");
+pub const internet = @import("internet.zig");
+pub const live_member = @import("live_member.zig");
+pub const imgproc = @import("imgproc.zig");
+pub const ocr = @import("ocr.zig");
+pub const express = @import("express.zig");
+pub const live_goods = @import("live_goods.zig");
+pub const live = @import("live.zig");
+pub const cloud = @import("cloud.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -50,4 +60,14 @@ test {
     _ = face;
     _ = device;
     _ = complaint;
+    _ = media;
+    _ = qrcode_jump;
+    _ = internet;
+    _ = live_member;
+    _ = imgproc;
+    _ = ocr;
+    _ = express;
+    _ = live_goods;
+    _ = live;
+    _ = cloud;
 }
