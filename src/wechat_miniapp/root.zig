@@ -33,6 +33,10 @@ pub const express = @import("express.zig");
 pub const live_goods = @import("live_goods.zig");
 pub const live = @import("live.zig");
 pub const cloud = @import("cloud.zig");
+pub const order_management = @import("order_management.zig");
+pub const order_shipping = @import("order_shipping.zig");
+pub const employee_relation = @import("employee_relation.zig");
+pub const customservice_work = @import("customservice_work.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -70,4 +74,8 @@ test {
     _ = live_goods;
     _ = live;
     _ = cloud;
+    _ = order_management;
+    _ = order_shipping;
+    _ = employee_relation;
+    _ = customservice_work;
 }
