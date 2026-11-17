@@ -37,6 +37,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "common", .module = common },
             .{ .name = "wechat_mp", .module = mp },
+            // 服务端 API 签名(RSA-PSS-SHA256,同城配送/手机号等加密通道),
+            // 与 pay 的 V3 签名共用 vendored zig-rsa。
+            .{ .name = "zig-rsa", .module = zig_rsa },
         },
     });
     const open = b.addModule("wechat_open", .{

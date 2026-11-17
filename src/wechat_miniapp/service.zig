@@ -15,6 +15,8 @@ const subscribe_msg = @import("subscribe_msg.zig");
 const qrcode = @import("qrcode.zig");
 const link = @import("link.zig");
 const uniform_msg = @import("uniform_msg.zig");
+pub const api_signature = @import("api_signature.zig");
+const intracity_mod = @import("intracity.zig");
 
 pub const WxResult = result_mod.WxResult;
 pub const Service = mp_service.Service; // 同构复用(wx_type 可覆写为 .mini_app)
@@ -41,6 +43,11 @@ pub const MiniappService = struct {
     qrcode_service: qrcode.QrcodeService = undefined,
     link_service: link.LinkService = undefined,
     uniform_msg_service: uniform_msg.UniformMsgService = undefined,
+    intracity_service: intracity_mod.IntracityService = undefined,
+    /// 服务端 API 签名状态(`enableApiSignature` 装入;null = 未启用,全部走
+    /// 普通明文通道)。启用后 base.executor 被替换为签名装饰器,命中等名 URL
+    /// 列表的 POST 透明加密 —— 对应 Java 配置 ApiSignatureAesKey 后的行为。
+    sig: ?api_signature.State = null,
 
     pub fn init(self: *MiniappService, gpa: std.mem.Allocator, cfg: mp_config.ConfigStorage, exec: mp_http.RequestExecutor) void {
         self.* = .{ .base = Service.init(gpa, cfg, exec) };
@@ -50,6 +57,25 @@ pub const MiniappService = struct {
         self.qrcode_service = .{ .svc = &self.base };
         self.link_service = .{ .svc = &self.base };
         self.uniform_msg_service = .{ .svc = &self.base };
+        self.intracity_service = .{ .ma = self };
+    }
+
+    /// 启用服务端 API 签名(对应 Java 配置 ApiSignatureAesKey/RsaPrivateKey
+    /// 后 BaseWxMaServiceImpl 的自动加密路由)。失败时返回错误且状态不变。
+    /// 本结构初始化后不得再移动(装饰器/子服务均持内部指针)。
+    pub fn enableApiSignature(self: *MiniappService, args: api_signature.Args) (api_signature.State.InitError || error{AlreadyEnabled})!void {
+        if (self.sig != null) return error.AlreadyEnabled; // 已启用:报错防重复包裹
+        self.sig = try api_signature.State.init(self.base.gpa, self.base.executor, args, self.base.config.appid());
+        self.base.executor = self.sig.?.executor();
+    }
+
+    /// 关闭并释放签名状态(恢复原执行器);测试用,生产常驻无需调用。
+    pub fn disableApiSignature(self: *MiniappService) void {
+        if (self.sig) |*st| {
+            self.base.executor = st.inner;
+            st.deinit();
+            self.sig = null;
+        }
     }
 
     /// 对应 `getSubscribeService()`(任务书要求名 `subscribeMsg()`)。
@@ -70,6 +96,11 @@ pub const MiniappService = struct {
     /// 对应 `getMsgService()` 的 sendUniformMsg 面(任务书要求名 `uniformMsgService()`)。
     pub fn uniformMsgService(self: *MiniappService) *uniform_msg.UniformMsgService {
         return &self.uniform_msg_service;
+    }
+
+    /// 对应 `getIntracityService()`(同城配送;接口要求 API 签名)。
+    pub fn intracity(self: *MiniappService) *intracity_mod.IntracityService {
+        return &self.intracity_service;
     }
 
     /// 对应 `WxMaUserService.getCode2SessionResult(jsCode)`。

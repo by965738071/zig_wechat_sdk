@@ -42,6 +42,8 @@ pub const reimburse_invoice = @import("reimburse_invoice.zig");
 pub const promotion = @import("promotion.zig");
 pub const product = @import("product.zig");
 pub const product_order = @import("product_order.zig");
+pub const intracity = @import("intracity.zig");
+pub const api_signature = @import("api_signature.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -88,4 +90,6 @@ test {
     _ = promotion;
     _ = product;
     _ = product_order;
+    _ = intracity;
+    _ = api_signature;
 }
