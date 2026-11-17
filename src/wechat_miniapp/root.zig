@@ -40,6 +40,8 @@ pub const customservice_work = @import("customservice_work.zig");
 pub const express_delivery_return = @import("express_delivery_return.zig");
 pub const reimburse_invoice = @import("reimburse_invoice.zig");
 pub const promotion = @import("promotion.zig");
+pub const product = @import("product.zig");
+pub const product_order = @import("product_order.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -84,4 +86,6 @@ test {
     _ = express_delivery_return;
     _ = reimburse_invoice;
     _ = promotion;
+    _ = product;
+    _ = product_order;
 }
