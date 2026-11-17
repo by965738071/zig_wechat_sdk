@@ -37,6 +37,9 @@ pub const order_management = @import("order_management.zig");
 pub const order_shipping = @import("order_shipping.zig");
 pub const employee_relation = @import("employee_relation.zig");
 pub const customservice_work = @import("customservice_work.zig");
+pub const express_delivery_return = @import("express_delivery_return.zig");
+pub const reimburse_invoice = @import("reimburse_invoice.zig");
+pub const promotion = @import("promotion.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -78,4 +81,7 @@ test {
     _ = order_shipping;
     _ = employee_relation;
     _ = customservice_work;
+    _ = express_delivery_return;
+    _ = reimburse_invoice;
+    _ = promotion;
 }
